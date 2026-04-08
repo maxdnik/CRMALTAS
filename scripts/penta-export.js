@@ -35,6 +35,7 @@ const LOGIN_SUCCESS_SCREENSHOT = path.join(DATA_DIR, "login-success.png");
 const STEP_DASHBOARD = path.join(DATA_DIR, "step-dashboard.png");
 const STEP_MENU_OPEN = path.join(DATA_DIR, "step-argentina-menu-open.png");
 const STEP_IMPORT_OPEN = path.join(DATA_DIR, "step-importaciones-detalladas-open.png");
+const POST_CLICK_PNG = path.join(DATA_DIR, "post-click.png");
 const STEP_MENU_BEFORE_IMPORT_CLICK = path.join(
   DATA_DIR,
   "step-menu-before-click-importaciones-detalladas.png"
@@ -530,93 +531,110 @@ async function clickImportacionesDetalladas(page, log, scopedMenu) {
     target,
   });
 
-  const clickResult = await page.evaluate(({ scopedArg, targetArg }) => {
-    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
-    const visible = (el) => {
-      const st = window.getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
-    };
-    const bbox = (el) => {
-      const r = el.getBoundingClientRect();
-      return { left: r.left, top: r.top, width: r.width, height: r.height };
-    };
-    const close = (a, b, t) => Math.abs(a - b) <= t;
-    const clickAt = (x, y) => {
-      const node = document.elementFromPoint(x, y);
-      if (!node) return false;
-      node.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y }));
-      node.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y }));
-      node.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y }));
-      return true;
-    };
+  // Target locator construido sobre el target YA detectado.
+  let targetLocator = page
+    .locator("ion-item.itemOperativaBar, .itemOperativaBar, ion-item, [role='menuitem'], [role='button'], li, div")
+    .filter({ hasText: target.text })
+    .first();
 
-    const rowSelector =
-      "button, a, [role='menuitem'], [role='button'], li, ion-item, mat-list-item, .menu-item, .dropdown-item, div";
-    const menuCandidates = Array.from(
-      document.querySelectorAll(
-        "[role='menu'], .dropdown-menu, .menu, .mat-mdc-menu-panel, .cdk-overlay-pane, ion-popover, ion-list, .popover, .p-menu, .p-tieredmenu"
-      )
-    ).filter(visible);
-    // IMPORTANTE: usar el menú previamente detectado por su caja.
-    const menu = menuCandidates.find((m) => {
-      const b = bbox(m);
-      return (
-        close(b.left, scopedArg.menuBox.left, 20) &&
-        close(b.top, scopedArg.menuBox.top, 20) &&
-        close(b.width, scopedArg.menuBox.width, 40) &&
-        close(b.height, scopedArg.menuBox.height, 60)
-      );
-    });
+  const targetVisible = await targetLocator.isVisible().catch(() => false);
+  if (!targetVisible) {
+    const rowsLocator = page.locator("ion-item.itemOperativaBar:visible, .itemOperativaBar:visible, ion-item:visible");
+    const rowsCount = await rowsLocator.count().catch(() => 0);
+    if (rowsCount >= 2) {
+      targetLocator = rowsLocator.nth(1);
+      log("target locator por fallback segunda fila visible", "warn", { rowsCount });
+    }
+  }
 
-    if (!menu) return { ok: false, strategy: "no-menu" };
+  await targetLocator.scrollIntoViewIfNeeded().catch(() => {});
 
-    const rows = Array.from(menu.querySelectorAll(rowSelector)).filter(visible);
-    const row = rows.find((el) => {
-      const t = normalize(el.innerText || el.textContent || "");
-      const b = bbox(el);
-      return (
-        t === targetArg.text &&
-        close(b.top, targetArg.boundingBox.top, 10) &&
-        close(b.left, targetArg.boundingBox.left, 18) &&
-        close(b.height, targetArg.boundingBox.height, 12)
-      );
-    });
+  let methodUsed = "";
+  let clicked = false;
+  let retried = false;
 
-    if (row) {
-      row.scrollIntoView({ block: "center", inline: "nearest" });
-      try {
-        row.click();
-        return { ok: true, strategy: "locator-click" };
-      } catch {
-        const r = row.getBoundingClientRect();
-        if (clickAt(r.left + r.width / 2, r.top + r.height / 2)) {
-          return { ok: true, strategy: "bbox-center-click" };
-        }
-        const icon = row.querySelector(
-          "ion-icon, i, svg, [class*='icon'], [class*='chevron'], [class*='arrow']"
+  // Intento 1: click sobre ion-item.
+  const targetIsIonItem = await targetLocator
+    .evaluate((el) => (el.tagName || "").toLowerCase() === "ion-item")
+    .catch(() => false);
+  if (targetIsIonItem) {
+    await targetLocator.click({ timeout: 5000 }).catch(() => {});
+    methodUsed = "ion-item";
+    clicked = true;
+  } else {
+    const ionItem = targetLocator.locator("ion-item").first();
+    if ((await ionItem.count().catch(() => 0)) > 0) {
+      await ionItem.click({ timeout: 5000 }).catch(() => {});
+      methodUsed = "ion-item";
+      clicked = true;
+    }
+  }
+
+  // Intento 2: clase .itemOperativaBar.
+  if (!clicked) {
+    const clickable = targetLocator.locator(".itemOperativaBar").first();
+    if ((await clickable.count().catch(() => 0)) > 0) {
+      await clickable.click({ timeout: 5000 }).catch(() => {});
+      methodUsed = "class";
+      clicked = true;
+    }
+  }
+
+  // Intento 3: bounding box SIEMPRE.
+  let lastBox = await targetLocator.boundingBox().catch(() => null);
+  if (!clicked) {
+    const box = lastBox || target.boundingBox || null;
+    if (box) {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      methodUsed = "bbox";
+      clicked = true;
+      lastBox = box;
+    }
+  }
+
+  // Nunca abortar sin intentar click.
+  if (!clicked) {
+    const fb = scoped.menuBox;
+    await page.mouse.click(fb.left + fb.width / 2, fb.top + (fb.height * 2.5) / 5);
+    methodUsed = "bbox";
+    clicked = true;
+  }
+
+  const beforeUrl = page.url();
+  const loadedAfterFirst = await Promise.race([
+    page
+      .waitForFunction(() => {
+        const txt = (document.body?.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+        return (
+          txt.includes("argentina - importaciones detalladas") &&
+          (txt.includes("consulta por parámetros") || txt.includes("consulta por parametros"))
         );
-        if (icon && visible(icon)) {
-          const ib = icon.getBoundingClientRect();
-          if (clickAt(ib.left + ib.width / 2, ib.top + ib.height / 2)) {
-            return { ok: true, strategy: "icon-click" };
-          }
-        }
-      }
+      }, { timeout: 10000 })
+      .then(() => true)
+      .catch(() => false),
+    page
+      .waitForURL((url) => url.toString() !== beforeUrl, { timeout: 10000 })
+      .then(() => true)
+      .catch(() => false),
+  ]);
+
+  // Retry obligatorio por bbox si no hubo cambio/carga.
+  if (!loadedAfterFirst) {
+    const retryBox = lastBox || (await targetLocator.boundingBox().catch(() => null)) || target.boundingBox || null;
+    if (retryBox) {
+      await page.mouse.click(retryBox.x + retryBox.width / 2, retryBox.y + retryBox.height / 2);
+      retried = true;
+      methodUsed = methodUsed || "bbox";
     }
+  }
 
-    // Fallback posicional dentro del menú (segunda fila).
-    const m = menu.getBoundingClientRect();
-    const targetY = m.top + (m.height * 2.5) / 5;
-    const targetX = m.left + 40;
-    if (clickAt(targetX, targetY)) {
-      return { ok: true, strategy: "menu-absolute-coordinate-click", targetX, targetY };
-    }
+  await page.screenshot({ path: POST_CLICK_PNG, fullPage: true }).catch(() => {});
 
-    return { ok: false, strategy: "none" };
-  }, { scopedArg: scoped, targetArg: target });
-
-  log("método de click ejecutado", clickResult.ok ? "info" : "warn", clickResult);
+  log("método de click ejecutado", "info", {
+    clickMethod: methodUsed || "bbox",
+    retried,
+    finalUrl: page.url(),
+  });
 
   const loaded = await page
     .waitForFunction(() => {
@@ -634,19 +652,21 @@ async function clickImportacionesDetalladas(page, log, scopedMenu) {
     const html = await page.content().catch(() => "");
     if (html) await fs.writeFile(IMPORT_CLICK_FAILED_HTML, html, "utf8");
     throw new Error(
-      `No cargó Importaciones Detalladas luego del click. Estrategia usada: ${clickResult.strategy || "none"}`
+      `No cargó Importaciones Detalladas luego del click. Estrategia usada: ${methodUsed || "bbox"}`
     );
   }
 
   log("click en Importaciones Detalladas ejecutado", "info", {
-    clickMethod: clickResult.strategy || "unknown",
+    clickMethod: methodUsed || "bbox",
     finalUrl: page.url(),
   });
 
   await waitForSettled(page);
   return {
-    clickStrategy: clickResult.strategy || "unknown",
+    clickStrategy: methodUsed || "bbox",
+    retry: retried,
     scopedOptions: scoped.rows.map((r) => r.text),
+    rowCount: scoped.rows.length,
   };
 }
 

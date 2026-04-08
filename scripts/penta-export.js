@@ -39,6 +39,8 @@ const STEP_MENU_BEFORE_IMPORT_CLICK = path.join(
   DATA_DIR,
   "step-menu-before-click-importaciones-detalladas.png"
 );
+const ARG_MENU_SCOPED_HTML = path.join(DATA_DIR, "argentina-menu-scoped.html");
+const ARG_MENU_SCOPED_PNG = path.join(DATA_DIR, "argentina-menu-scoped.png");
 const IMPORT_CLICK_FAILED_HTML = path.join(DATA_DIR, "importaciones-detalladas-click-failed.html");
 const IMPORT_CLICK_FAILED_PNG = path.join(DATA_DIR, "importaciones-detalladas-click-failed.png");
 
@@ -380,175 +382,8 @@ async function findAndOpenArgentinaMenu(page, log) {
   return result;
 }
 
-async function waitArgentinaMenuOpened(page, log) {
-  const opened = await page
-    .waitForFunction(() => {
-      const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const visible = (el) => {
-        const st = window.getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
-      };
-      const items = Array.from(document.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, span, div"))
-        .filter(visible)
-        .map((el) => normalize(el.innerText || el.textContent || ""))
-        .filter(Boolean);
-      const hasImportaciones = items.some((t) => t.includes("importaciones"));
-      const hasImportDet = items.some((t) => t.includes("importaciones detalladas"));
-      const hasExportaciones = items.some((t) => t.includes("exportaciones"));
-      return hasImportaciones && hasImportDet && hasExportaciones;
-    }, { timeout: 10000 })
-    .then(() => true)
-    .catch(() => false);
-
-  if (!opened) {
-    throw new Error("No se abrió el menú desplegable de Argentina");
-  }
-
-  log("menú argentina abierto");
-}
-
-async function clickImportacionesDetalladas(page, log) {
-  await page.screenshot({ path: STEP_MENU_BEFORE_IMPORT_CLICK, fullPage: true }).catch(() => {});
-
-  const menuAnalysis = await page.evaluate(() => {
-    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
-    const visible = (el) => {
-      const st = window.getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
-    };
-    const bbox = (el) => {
-      const r = el.getBoundingClientRect();
-      return { left: r.left, top: r.top, width: r.width, height: r.height, right: r.right, bottom: r.bottom };
-    };
-
-    const allMenuNodes = Array.from(
-      document.querySelectorAll("[role='menu'], .menu, .dropdown-menu, .popover, ion-popover, ion-list, ul, .mat-mdc-menu-panel")
-    ).filter(visible);
-
-    // Heurística: contenedor que más se parece a menú Argentina (con varias filas visibles y texto import/export)
-    let bestMenu = null;
-    let bestScore = -1;
-    for (const menu of allMenuNodes) {
-      const txt = normalize(menu.innerText || menu.textContent || "").toLowerCase();
-      const rows = Array.from(menu.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, div, ion-item, mat-list-item"))
-        .filter(visible)
-        .filter((el) => normalize(el.innerText || el.textContent || "").length > 0);
-      let score = rows.length;
-      if (txt.includes("importaciones detalladas")) score += 20;
-      if (txt.includes("importaciones")) score += 10;
-      if (txt.includes("exportaciones")) score += 10;
-      if (score > bestScore) {
-        bestScore = score;
-        bestMenu = menu;
-      }
-    }
-
-    // fallback si no encontró menú claro
-    if (!bestMenu) {
-      const fallbackRows = Array.from(
-        document.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, div, ion-item, mat-list-item")
-      )
-        .filter(visible)
-        .filter((el) => normalize(el.innerText || el.textContent || "").length > 0)
-        .filter((el) => bbox(el).top < window.innerHeight * 0.65)
-        .slice(0, 30);
-
-      const rowsData = fallbackRows.map((row, idx) => ({
-        index: idx + 1,
-        text: normalize(row.innerText || row.textContent || "").slice(0, 200),
-        tagName: (row.tagName || "").toLowerCase(),
-        className: String(row.className || "").slice(0, 180),
-        role: row.getAttribute("role") || "",
-        boundingBox: bbox(row),
-        outerHTML: (row.outerHTML || "").replace(/\s+/g, " ").trim().slice(0, 260),
-      }));
-      return {
-        menuFound: false,
-        menuBox: null,
-        rows: rowsData,
-        targetRow: rowsData[1] || null,
-      };
-    }
-
-    const rowCandidates = Array.from(
-      bestMenu.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, div, ion-item, mat-list-item")
-    )
-      .filter(visible)
-      .filter((el) => {
-        const t = normalize(el.innerText || el.textContent || "");
-        const r = bbox(el);
-        return t.length > 0 && r.height >= 18;
-      });
-
-    // Deduplicar visualmente por bbox similar (padres/hijos repetidos)
-    const dedupRows = [];
-    for (const row of rowCandidates) {
-      const r = bbox(row);
-      const exists = dedupRows.some((existing) => {
-        const e = bbox(existing);
-        return Math.abs(e.top - r.top) < 4 && Math.abs(e.left - r.left) < 8 && Math.abs(e.height - r.height) < 6;
-      });
-      if (!exists) dedupRows.push(row);
-    }
-
-    dedupRows.sort((a, b) => bbox(a).top - bbox(b).top);
-
-    const rowsData = dedupRows.map((row, idx) => ({
-      index: idx + 1,
-      text: normalize(row.innerText || row.textContent || "").slice(0, 200),
-      tagName: (row.tagName || "").toLowerCase(),
-      className: String(row.className || "").slice(0, 180),
-      id: row.id || "",
-      role: row.getAttribute("role") || "",
-      boundingBox: bbox(row),
-      outerHTML: (row.outerHTML || "").replace(/\s+/g, " ").trim().slice(0, 260),
-    }));
-
-    // objetivo principal: segunda fila visible
-    const targetRowEl = dedupRows[1] || null;
-    const targetRow = rowsData[1] || null;
-
-    // ícono de segunda fila (fallback obligatorio)
-    let targetIcon = null;
-    if (targetRowEl) {
-      const icon = targetRowEl.querySelector("ion-icon, i, svg, .icon, [class*='icon'], [class*='chevron'], [class*='arrow']");
-      if (icon && visible(icon)) {
-        targetIcon = {
-          tagName: (icon.tagName || "").toLowerCase(),
-          className: String(icon.className || "").slice(0, 180),
-          boundingBox: bbox(icon),
-        };
-      }
-    }
-
-    const menuBox = bbox(bestMenu);
-
-    return {
-      menuFound: true,
-      menuBox,
-      rows: rowsData.slice(0, 20),
-      targetRow,
-      targetIcon,
-    };
-  });
-
-  log("ítems de menú detectados", "info", {
-    count: menuAnalysis.rows.length,
-    rows: menuAnalysis.rows,
-  });
-
-  if (!menuAnalysis.targetRow) {
-    throw new Error("No se pudo identificar la segunda fila visible del menú de Argentina");
-  }
-
-  log("segunda fila seleccionada como target", "info", {
-    targetRow: menuAnalysis.targetRow,
-  });
-
-  let clickStrategyUsed = "";
-  const clickResult = await page.evaluate((targetInfo, menuInfo) => {
+async function detectArgentinaMenuScoped(page) {
+  return page.evaluate(() => {
     const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
     const visible = (el) => {
       const st = window.getComputedStyle(el);
@@ -559,68 +394,228 @@ async function clickImportacionesDetalladas(page, log) {
       const r = el.getBoundingClientRect();
       return { left: r.left, top: r.top, width: r.width, height: r.height };
     };
+    const expected = [
+      "importaciones",
+      "importaciones detalladas",
+      "exportaciones",
+      "exportaciones detalladas",
+      "otras operaciones",
+    ];
+    const rowSelector =
+      "button, a, [role='menuitem'], [role='button'], li, ion-item, mat-list-item, .menu-item, .dropdown-item, div";
 
+    const candidateMenus = Array.from(
+      document.querySelectorAll(
+        "[role='menu'], .dropdown-menu, .menu, .mat-mdc-menu-panel, .cdk-overlay-pane, ion-popover, ion-list, .popover, .p-menu, .p-tieredmenu"
+      )
+    ).filter(visible);
+
+    const scoreMenu = (menu) => {
+      const box = bbox(menu);
+      const rows = Array.from(menu.querySelectorAll(rowSelector))
+        .filter(visible)
+        .map((el) => normalize(el.innerText || el.textContent || ""))
+        .filter((txt) => txt.length > 0 && txt.length < 80);
+      const rowsUniq = [...new Set(rows)];
+      const lowers = rowsUniq.map((t) => t.toLowerCase());
+      const matches = expected.filter((e) => lowers.includes(e)).length;
+      let score = matches * 100;
+      if (rowsUniq.length >= 4 && rowsUniq.length <= 8) score += 40;
+      if (box.width <= 600 && box.height <= 700) score += 20;
+      if (box.width > window.innerWidth * 0.9 || box.height > window.innerHeight * 0.9) score -= 120;
+      if (lowers.some((t) => /américa|africa|asia|europa/.test(t))) score -= 80;
+      return { score, rowsUniq, box };
+    };
+
+    let best = null;
+    for (const menu of candidateMenus) {
+      const scored = scoreMenu(menu);
+      if (!best || scored.score > best.score) {
+        best = { menu, ...scored };
+      }
+    }
+    if (!best || best.score < 120) {
+      return {
+        menuFound: false,
+        menuBox: null,
+        options: [],
+        rows: [],
+      };
+    }
+
+    const rowNodesRaw = Array.from(best.menu.querySelectorAll(rowSelector)).filter(visible);
+    const rowNodes = rowNodesRaw.filter((el) => {
+      const txt = normalize(el.innerText || el.textContent || "");
+      const b = bbox(el);
+      if (!txt || txt.length > 120) return false;
+      return b.height >= 18 && b.height <= 80 && b.width >= 80;
+    });
+
+    rowNodes.sort((a, b) => bbox(a).top - bbox(b).top);
+    const rowsData = rowNodes.map((row, index) => ({
+      index: index + 1,
+      text: normalize(row.innerText || row.textContent || "").slice(0, 200),
+      tagName: (row.tagName || "").toLowerCase(),
+      className: String(row.className || "").slice(0, 200),
+      id: row.id || "",
+      role: row.getAttribute("role") || "",
+      boundingBox: bbox(row),
+      outerHTML: (row.outerHTML || "").replace(/\s+/g, " ").trim().slice(0, 260),
+    }));
+
+    const targetByText =
+      rowsData.find((r) => normalize(r.text).toLowerCase() === "importaciones detalladas") || null;
+    const targetSecondRow = rowsData[1] || null;
+
+    return {
+      menuFound: true,
+      menuBox: best.box,
+      options: best.rowsUniq,
+      rows: rowsData,
+      targetByText,
+      targetSecondRow,
+    };
+  });
+}
+
+async function waitArgentinaMenuOpened(page, log) {
+  let scoped = null;
+  const started = Date.now();
+  while (Date.now() - started < 10000) {
+    scoped = await detectArgentinaMenuScoped(page).catch(() => null);
+    if (scoped?.menuFound && scoped.rows.length >= 4) break;
+    await sleep(250);
+  }
+
+  if (!scoped?.menuFound) {
+    throw new Error("No se detectó el contenedor real del menú desplegado de Argentina");
+  }
+
+  await page.screenshot({ path: ARG_MENU_SCOPED_PNG, fullPage: true }).catch(() => {});
+  const html = await page.content().catch(() => "");
+  if (html) await fs.writeFile(ARG_MENU_SCOPED_HTML, html, "utf8");
+
+  log("menú argentina abierto", "info", {
+    menuBox: scoped.menuBox,
+    options: scoped.options,
+    scopedRows: scoped.rows.length,
+    artifacts: {
+      html: ARG_MENU_SCOPED_HTML,
+      png: ARG_MENU_SCOPED_PNG,
+    },
+  });
+
+  return scoped;
+}
+
+async function clickImportacionesDetalladas(page, log, scopedMenu) {
+  await page.screenshot({ path: STEP_MENU_BEFORE_IMPORT_CLICK, fullPage: true }).catch(() => {});
+
+  const scoped = scopedMenu || (await detectArgentinaMenuScoped(page));
+  if (!scoped?.menuFound) {
+    throw new Error("No se encontró menú scopiado de Argentina para clickear opción");
+  }
+
+  log("opciones detectadas dentro del menú scopiado", "info", {
+    optionTexts: scoped.rows.map((r) => r.text),
+  });
+
+  const target = scoped.targetByText || scoped.targetSecondRow;
+  if (!target) {
+    throw new Error("No se pudo determinar target en menú (ni texto exacto ni segunda fila)");
+  }
+
+  log("target real seleccionado", "info", {
+    mode: scoped.targetByText ? "text-exact-match" : "second-row-fallback",
+    target,
+  });
+
+  const clickResult = await page.evaluate(({ scopedArg, targetArg }) => {
+    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
+    const visible = (el) => {
+      const st = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+    };
+    const bbox = (el) => {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top, width: r.width, height: r.height };
+    };
+    const close = (a, b, t) => Math.abs(a - b) <= t;
     const clickAt = (x, y) => {
-      const target = document.elementFromPoint(x, y);
-      if (!target) return false;
-      target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y }));
-      target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y }));
-      target.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y }));
+      const node = document.elementFromPoint(x, y);
+      if (!node) return false;
+      node.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y }));
+      node.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y }));
+      node.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y }));
       return true;
     };
 
-    // localizar fila objetivo por bbox+texto
-    const allRows = Array.from(
-      document.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, div, ion-item, mat-list-item")
+    const rowSelector =
+      "button, a, [role='menuitem'], [role='button'], li, ion-item, mat-list-item, .menu-item, .dropdown-item, div";
+    const menuCandidates = Array.from(
+      document.querySelectorAll(
+        "[role='menu'], .dropdown-menu, .menu, .mat-mdc-menu-panel, .cdk-overlay-pane, ion-popover, ion-list, .popover, .p-menu, .p-tieredmenu"
+      )
     ).filter(visible);
-    const target = allRows.find((el) => {
-      const t = normalize(el.innerText || el.textContent || "").slice(0, 200);
-      const r = bbox(el);
+    const menu = menuCandidates.find((m) => {
+      const b = bbox(m);
       return (
-        t === targetInfo.text &&
-        Math.abs(r.top - targetInfo.boundingBox.top) < 8 &&
-        Math.abs(r.left - targetInfo.boundingBox.left) < 12 &&
-        Math.abs(r.height - targetInfo.boundingBox.height) < 10
+        close(b.left, scopedArg.menuBox.left, 20) &&
+        close(b.top, scopedArg.menuBox.top, 20) &&
+        close(b.width, scopedArg.menuBox.width, 40) &&
+        close(b.height, scopedArg.menuBox.height, 60)
+      );
+    }) || menuCandidates[0];
+
+    if (!menu) return { ok: false, strategy: "no-menu" };
+
+    const rows = Array.from(menu.querySelectorAll(rowSelector)).filter(visible);
+    const row = rows.find((el) => {
+      const t = normalize(el.innerText || el.textContent || "");
+      const b = bbox(el);
+      return (
+        t === targetArg.text &&
+        close(b.top, targetArg.boundingBox.top, 10) &&
+        close(b.left, targetArg.boundingBox.left, 18) &&
+        close(b.height, targetArg.boundingBox.height, 12)
       );
     });
 
-    if (target) {
-      target.scrollIntoView({ block: "center", inline: "nearest" });
+    if (row) {
+      row.scrollIntoView({ block: "center", inline: "nearest" });
       try {
-        target.click();
-        return { ok: true, strategy: "locator/dom-row-click" };
+        row.click();
+        return { ok: true, strategy: "locator-click" };
       } catch {
-        const r = target.getBoundingClientRect();
-        const centerOk = clickAt(r.left + r.width / 2, r.top + r.height / 2);
-        if (centerOk) return { ok: true, strategy: "bbox-row-center-click" };
-        const leftShiftOk = clickAt(r.left + Math.max(24, Math.min(44, r.width * 0.2)), r.top + r.height / 2);
-        if (leftShiftOk) return { ok: true, strategy: "bbox-row-left-shift-click" };
+        const r = row.getBoundingClientRect();
+        if (clickAt(r.left + r.width / 2, r.top + r.height / 2)) {
+          return { ok: true, strategy: "bbox-center-click" };
+        }
+        const icon = row.querySelector(
+          "ion-icon, i, svg, [class*='icon'], [class*='chevron'], [class*='arrow']"
+        );
+        if (icon && visible(icon)) {
+          const ib = icon.getBoundingClientRect();
+          if (clickAt(ib.left + ib.width / 2, ib.top + ib.height / 2)) {
+            return { ok: true, strategy: "icon-click" };
+          }
+        }
       }
     }
 
-    // fallback 1: click icono segunda fila
-    if (targetInfo.targetIcon && targetInfo.targetIcon.boundingBox) {
-      const ib = targetInfo.targetIcon.boundingBox;
-      const iconCenterOk = clickAt(ib.left + ib.width / 2, ib.top + ib.height / 2);
-      if (iconCenterOk) return { ok: true, strategy: "second-row-icon-bbox-click" };
-    }
-
-    // fallback 2: coordenada absoluta basada en menú
-    if (menuInfo && menuInfo.menuBox) {
-      const m = menuInfo.menuBox;
-      const targetX = m.left + 40;
-      const targetY = m.top + (m.height * 2.5) / 5;
-      const absOk = clickAt(targetX, targetY);
-      if (absOk) return { ok: true, strategy: "absolute-menu-coordinate-click", targetX, targetY };
+    // Fallback posicional dentro del menú (segunda fila).
+    const m = menu.getBoundingClientRect();
+    const targetY = m.top + (m.height * 2.5) / 5;
+    const targetX = m.left + 40;
+    if (clickAt(targetX, targetY)) {
+      return { ok: true, strategy: "menu-absolute-coordinate-click", targetX, targetY };
     }
 
     return { ok: false, strategy: "none" };
-  }, menuAnalysis.targetRow, menuAnalysis);
+  }, { scopedArg: scoped, targetArg: target });
 
-  clickStrategyUsed = clickResult.strategy || "none";
-  log("click sobre segunda fila ejecutado", clickResult.ok ? "info" : "warn", {
-    clickStrategy: clickStrategyUsed,
-  });
+  log("método de click ejecutado", clickResult.ok ? "info" : "warn", clickResult);
 
   const loaded = await page
     .waitForFunction(() => {
@@ -638,15 +633,20 @@ async function clickImportacionesDetalladas(page, log) {
     const html = await page.content().catch(() => "");
     if (html) await fs.writeFile(IMPORT_CLICK_FAILED_HTML, html, "utf8");
     throw new Error(
-      `No cargó Importaciones Detalladas luego del click en segunda fila. Estrategia usada: ${clickStrategyUsed}`
+      `No cargó Importaciones Detalladas luego del click. Estrategia usada: ${clickResult.strategy || "none"}`
     );
   }
 
   log("click en Importaciones Detalladas ejecutado", "info", {
-    clickStrategy: clickStrategyUsed,
+    clickMethod: clickResult.strategy || "unknown",
+    finalUrl: page.url(),
   });
+
   await waitForSettled(page);
-  return { clickStrategy: clickStrategyUsed, rowCount: menuAnalysis.rows.length };
+  return {
+    clickStrategy: clickResult.strategy || "unknown",
+    scopedOptions: scoped.rows.map((r) => r.text),
+  };
 }
 
 async function waitImportacionesDetalladasLoaded(page, log) {

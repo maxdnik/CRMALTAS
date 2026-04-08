@@ -24,37 +24,27 @@ const CONFIG = {
   pass: process.env.PENTA_PASS,
   baseUrl: process.env.PENTA_BASE_URL.replace(/\/+$/, ""),
   headless: process.env.HEADLESS !== "false",
-  timeoutMs: Number(process.env.PLAYWRIGHT_TIMEOUT_MS || 45000),
-  maxFilterCombos: Number(process.env.MAX_FILTER_COMBOS || 1000),
-  maxPagesPerFilterSet: Number(process.env.MAX_PAGES_PER_FILTER_SET || 500),
+  timeoutMs: Number(process.env.PLAYWRIGHT_TIMEOUT_MS || 50000),
+  maxPagesPerModule: Number(process.env.MAX_PAGES_PER_MODULE || 500),
+  maxFilterCombos: Number(process.env.MAX_FILTER_COMBOS || 500),
 };
 
 const ROOT_DIR = path.resolve(__dirname, "..");
 const DATA_DIR = path.join(ROOT_DIR, "data");
 const MODULES = [
   {
-    key: "importadores_argentina",
-    prettyName: "Importadores en Argentina",
-    candidates: [
-      "/home/formulario/AR/importDetalladas",
-      "/home/formulario/AR/importacionesDetalladas",
-      "/home/formulario/AR/importadores",
-    ],
-    menuRegex: /(import|importaciones|importador)/i,
+    key: "importadores",
+    urlPath: "/home/formulario/AR/importDetalladas",
+    companyType: "consignee",
+    debugBaseName: "debug-importadores",
   },
   {
-    key: "exportadores_argentina",
-    prettyName: "Exportadores de Argentina",
-    candidates: [
-      "/home/formulario/AR/exportDetalladas",
-      "/home/formulario/AR/exportacionesDetalladas",
-      "/home/formulario/AR/exportadores",
-    ],
-    menuRegex: /(export|exportaciones|exportador)/i,
+    key: "exportadores",
+    urlPath: "/home/formulario/AR/exportDetalladas",
+    companyType: "shipper",
+    debugBaseName: "debug-exportadores",
   },
 ];
-
-const globalEvents = [];
 
 function nowIso() {
   return new Date().toISOString();
@@ -67,125 +57,87 @@ function safeSlug(value) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
-    .slice(0, 80) || "na";
+    .slice(0, 120) || "na";
 }
 
-function isTruthyString(v) {
-  return typeof v === "string" && v.trim().length > 0;
+function isTruthy(v) {
+  return v !== null && v !== undefined && String(v).trim().length > 0;
 }
 
 function summarizeError(error) {
   if (!error) return "unknown_error";
-  if (error instanceof Error) {
-    return `${error.name}: ${error.message}`;
-  }
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
 }
 
-function hashRow(row) {
-  return crypto.createHash("sha1").update(JSON.stringify(row)).digest("hex");
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function createLogger(moduleKey, localLogs) {
+function makeLogger(scope, sink) {
   return (message, level = "info", extra = undefined) => {
-    const event = {
+    const entry = {
       ts: nowIso(),
       level,
-      module: moduleKey,
+      scope,
       message,
       extra: extra ? JSON.stringify(extra) : "",
     };
-    localLogs.push(event);
-    globalEvents.push(event);
-    const printable =
-      extra !== undefined ? `${message} | ${JSON.stringify(extra)}` : message;
-    console.log(`[${event.ts}] [${level.toUpperCase()}] [${moduleKey}] ${printable}`);
+    sink.push(entry);
+    const extraTxt = extra ? ` | ${JSON.stringify(extra)}` : "";
+    console.log(`[${entry.ts}] [${level.toUpperCase()}] [${scope}] ${message}${extraTxt}`);
   };
 }
 
 async function ensureDirectories() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+  if (!fssync.existsSync(DATA_DIR)) {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+  }
 }
 
-async function saveDebugArtifacts(page, label, log) {
-  const ts = nowIso().replace(/[:.]/g, "-");
-  const base = path.join(DATA_DIR, `${safeSlug(label)}_${ts}`);
-  const screenshotPath = `${base}.png`;
-  const htmlPath = `${base}.html`;
-
-  try {
-    await page.screenshot({ path: screenshotPath, fullPage: true });
-    log("Screenshot de error guardado", "warn", { screenshotPath });
-  } catch (error) {
-    log("No se pudo guardar screenshot", "warn", { error: summarizeError(error) });
-  }
-
-  try {
-    const html = await page.content();
-    await fs.writeFile(htmlPath, html, "utf8");
-    log("HTML de error guardado", "warn", { htmlPath });
-  } catch (error) {
-    log("No se pudo guardar HTML", "warn", { error: summarizeError(error) });
-  }
+async function waitForSettled(page) {
+  await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
 }
 
 async function retry(action, options = {}) {
-  const {
-    retries = 3,
-    delayMs = 1000,
-    onRetry = () => {},
-    actionName = "action",
-  } = options;
-
-  let lastError;
+  const { retries = 3, delayMs = 1200, actionName = "action", onRetry = () => {} } = options;
+  let lastErr;
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
       return await action(attempt);
     } catch (error) {
-      lastError = error;
+      lastErr = error;
       if (attempt < retries) {
         await onRetry(attempt, error);
-        await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+        await sleep(delayMs * attempt);
       }
     }
   }
-
-  throw new Error(`${actionName} failed: ${summarizeError(lastError)}`);
+  throw new Error(`${actionName} failed: ${summarizeError(lastErr)}`);
 }
 
-async function waitForPageSettled(page) {
-  await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => {});
-  await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
-}
-
-async function readElementDescriptor(locator) {
-  return locator.evaluate((node) => {
-    const text = (node.innerText || node.textContent || "").trim();
-    return {
-      text,
-      value: node.value || "",
-      title: node.getAttribute("title") || "",
-      ariaLabel: node.getAttribute("aria-label") || "",
-      role: node.getAttribute("role") || "",
-    };
-  });
-}
-
-async function findFirstClickableByRegex(page, regex) {
-  const candidates = page.locator(
-    'button, [role="button"], a, input[type="button"], input[type="submit"]'
+async function findVisibleClickable(page, regex) {
+  const loc = page.locator(
+    'button, [role="button"], a, input[type="button"], input[type="submit"], .btn'
   );
-  const count = await candidates.count();
+  const count = await loc.count().catch(() => 0);
   for (let i = 0; i < count; i += 1) {
-    const item = candidates.nth(i);
-    if (!(await item.isVisible().catch(() => false))) continue;
-    if (!(await item.isEnabled().catch(() => true))) continue;
-    const desc = await readElementDescriptor(item).catch(() => null);
-    if (!desc) continue;
-    const haystack = `${desc.text} ${desc.value} ${desc.title} ${desc.ariaLabel}`.trim();
-    if (regex.test(haystack)) {
-      return item;
-    }
+    const item = loc.nth(i);
+    const visible = await item.isVisible().catch(() => false);
+    if (!visible) continue;
+    const enabled = await item.isEnabled().catch(() => true);
+    if (!enabled) continue;
+    const text = await item
+      .evaluate((el) => {
+        const v = el.value || "";
+        const t = el.innerText || el.textContent || "";
+        const a = el.getAttribute("aria-label") || "";
+        const ttl = el.getAttribute("title") || "";
+        return `${v} ${t} ${a} ${ttl}`.replace(/\s+/g, " ").trim();
+      })
+      .catch(() => "");
+    if (regex.test(text)) return item;
   }
   return null;
 }
@@ -194,473 +146,504 @@ async function maybeLogin(page, log) {
   const loginNeeded = await page
     .evaluate(() => {
       const url = window.location.href.toLowerCase();
-      const hasPassword = Boolean(document.querySelector('input[type="password"]'));
-      const hasLoginWord = /login|signin|ingresar|sesion|session/.test(url);
-      return hasPassword || hasLoginWord;
+      const passInput = Boolean(document.querySelector('input[type="password"]'));
+      const loginWord = /login|signin|ingresar|sesion|session/.test(url);
+      return passInput || loginWord;
     })
     .catch(() => false);
 
   if (!loginNeeded) {
-    log("Sesion ya autenticada o login no requerido");
+    log("Sesión reutilizada / login no requerido");
     return;
   }
 
   log("Login detectado, completando credenciales");
 
-  const userInputSelectors = [
-    'input[name*="user" i]',
-    'input[id*="user" i]',
-    'input[name*="mail" i]',
-    'input[type="email"]',
-    'input[placeholder*="usuario" i]',
-    'input[placeholder*="correo" i]',
-    "input[type='text']",
-  ];
-  const passInputSelectors = [
-    'input[name*="pass" i]',
-    'input[id*="pass" i]',
-    'input[placeholder*="clave" i]',
-    'input[placeholder*="contras" i]',
-    'input[type="password"]',
-  ];
+  const userLocator = page.locator(
+    [
+      'input[name*="user" i]',
+      'input[id*="user" i]',
+      'input[name*="mail" i]',
+      'input[type="email"]',
+      'input[placeholder*="usuario" i]',
+      "input[type='text']",
+    ].join(",")
+  );
 
-  const userLocator = page.locator(userInputSelectors.join(","));
-  const passLocator = page.locator(passInputSelectors.join(","));
+  const passLocator = page.locator(
+    [
+      'input[name*="pass" i]',
+      'input[id*="pass" i]',
+      'input[placeholder*="clave" i]',
+      'input[placeholder*="contras" i]',
+      'input[type="password"]',
+    ].join(",")
+  );
 
   if (!(await userLocator.first().isVisible().catch(() => false))) {
-    throw new Error("No se encontro input de usuario en login");
+    throw new Error("Input de usuario no encontrado");
   }
   if (!(await passLocator.first().isVisible().catch(() => false))) {
-    throw new Error("No se encontro input de password en login");
+    throw new Error("Input de contraseña no encontrado");
   }
 
-  await userLocator.first().fill(CONFIG.user, { timeout: 12000 });
-  await passLocator.first().fill(CONFIG.pass, { timeout: 12000 });
+  await userLocator.first().fill(CONFIG.user, { timeout: 15000 });
+  await passLocator.first().fill(CONFIG.pass, { timeout: 15000 });
 
-  const submit = await findFirstClickableByRegex(
+  const submit = await findVisibleClickable(
     page,
     /(ingresar|iniciar|acceder|login|entrar|submit)/i
   );
-
   if (submit) {
     await Promise.all([
-      page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {}),
+      page.waitForLoadState("networkidle", { timeout: 35000 }).catch(() => {}),
       submit.click({ timeout: 12000 }),
     ]);
   } else {
     await passLocator.first().press("Enter");
-    await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 35000 }).catch(() => {});
   }
 
   const stillLogin = await page
     .evaluate(() => {
-      const hasPassword = Boolean(document.querySelector('input[type="password"]'));
       const url = window.location.href.toLowerCase();
-      return hasPassword && /login|signin|ingresar|sesion|session/.test(url);
+      const passInput = Boolean(document.querySelector('input[type="password"]'));
+      return passInput && /login|signin|ingresar|sesion|session/.test(url);
     })
     .catch(() => true);
 
   if (stillLogin) {
-    throw new Error("No se pudo autenticar: pantalla de login continua visible");
+    throw new Error("Login no completado: la vista de autenticación sigue visible");
   }
-
   log("login ok");
 }
 
-async function maybeOpenAdvancedSearch(page, log) {
-  const trigger = await findFirstClickableByRegex(
-    page,
-    /(busqueda avanzada|búsqueda avanzada|advanced search|filtros|mostrar filtros)/i
-  );
-  if (!trigger) return false;
+function createNetworkCollector(page, log) {
+  const collected = [];
+  const keywordRegex = /(import|export|detalle|search|data|grid|formulario)/i;
 
-  try {
-    await trigger.click({ timeout: 10000 });
-    await waitForPageSettled(page);
-    log("Búsqueda avanzada/filtros expandida");
-    return true;
-  } catch {
-    return false;
-  }
-}
+  const onResponse = async (response) => {
+    try {
+      const req = response.request();
+      const url = response.url();
+      const method = req.method();
+      const resourceType = req.resourceType();
+      const contentType = response.headers()["content-type"] || "";
 
-async function detectFilters(page, log) {
-  const filterInfo = await page.evaluate(() => {
-    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
-    const getLabel = (el) => {
-      const id = el.id;
-      if (id) {
-        const byFor = document.querySelector(`label[for="${id}"]`);
-        if (byFor) return normalize(byFor.textContent);
-      }
-      const withinLabel = el.closest("label");
-      if (withinLabel) return normalize(withinLabel.textContent);
-      const wrapper = el.closest("div, section, form, td, th");
-      if (wrapper) {
-        const label = wrapper.querySelector("label, strong, .label, .form-label");
-        if (label) return normalize(label.textContent);
-      }
-      return normalize(
-        el.getAttribute("aria-label") ||
-          el.getAttribute("placeholder") ||
-          el.name ||
-          el.id ||
-          ""
-      );
-    };
-    const visible = (el) => {
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return (
-        style &&
-        style.visibility !== "hidden" &&
-        style.display !== "none" &&
-        rect.width > 0 &&
-        rect.height > 0
-      );
-    };
+      if (!keywordRegex.test(url) && !/(xhr|fetch)/i.test(resourceType)) return;
 
-    const selectNodes = Array.from(document.querySelectorAll("select")).filter(visible);
-    const inputNodes = Array.from(
-      document.querySelectorAll('input[type="date"], input[placeholder*="fecha" i]')
-    ).filter(visible);
-
-    const selects = selectNodes.map((el, index) => {
-      const options = Array.from(el.options || []).map((opt) => ({
-        value: opt.value,
-        text: normalize(opt.textContent),
-      }));
-      return {
-        index,
-        label: getLabel(el),
-        name: el.name || "",
-        id: el.id || "",
-        options,
+      const item = {
+        ts: nowIso(),
+        url,
+        method,
+        status: response.status(),
+        resourceType,
+        contentType,
+        payloadType: "none",
+        sampleSize: 0,
+        parsedRecords: [],
       };
-    });
 
-    const dateInputs = inputNodes.map((el, index) => ({
-      index,
-      label: getLabel(el),
-      name: el.name || "",
-      id: el.id || "",
-      min: el.min || "",
-      max: el.max || "",
-    }));
+      const isJson = /application\/json|text\/json|javascript|problem\+json/i.test(contentType);
+      if (isJson) {
+        const body = await response.text().catch(() => "");
+        if (body && body.length > 0) {
+          item.sampleSize = body.length;
+          try {
+            const parsed = JSON.parse(body);
+            item.payloadType = "json";
+            item.parsedRecords = extractRecordsFromJsonPayload(parsed, url);
+          } catch {
+            item.payloadType = "text";
+          }
+        }
+      }
 
-    return { selects, dateInputs };
-  });
-
-  const pageSizeRegex = /(registros|filas|mostrar|cantidad|items|resultados|por p[aá]gina|page size)/i;
-  const countryRegex = /(pa[ií]s|country|origen|destino)/i;
-  const periodRegex = /(periodo|per[ií]odo|fecha|a[nñ]o|anio|mes|desde|hasta)/i;
-
-  const plans = {
-    pageSize: null,
-    country: [],
-    period: [],
-    generic: [],
-    dateInputs: filterInfo.dateInputs || [],
-    allSelectsCount: (filterInfo.selects || []).length,
+      collected.push(item);
+    } catch (error) {
+      log("Error capturando response de red", "warn", { error: summarizeError(error) });
+    }
   };
 
-  for (const selectMeta of filterInfo.selects || []) {
-    const enrichedLabel = `${selectMeta.label} ${selectMeta.name} ${selectMeta.id}`.trim();
-    const validOptions = (selectMeta.options || []).filter((opt) =>
-      isTruthyString(opt.value) || isTruthyString(opt.text)
-    );
-    if (!validOptions.length) continue;
+  page.on("response", onResponse);
+  return {
+    getAll: () => collected,
+    stop: () => page.off("response", onResponse),
+  };
+}
 
-    if (pageSizeRegex.test(enrichedLabel)) {
-      const withNumeric = validOptions
-        .map((opt) => ({
-          ...opt,
-          number: Number(String(opt.value || opt.text).replace(/[^\d]/g, "")),
-        }))
-        .filter((x) => Number.isFinite(x.number) && x.number > 0)
-        .sort((a, b) => a.number - b.number);
-      plans.pageSize = {
-        ...selectMeta,
-        selectedOption:
-          withNumeric.length > 0 ? withNumeric[withNumeric.length - 1] : validOptions[validOptions.length - 1],
-      };
-      continue;
-    }
-
-    if (countryRegex.test(enrichedLabel)) {
-      plans.country.push({
-        ...selectMeta,
-        values: validOptions,
-      });
-      continue;
-    }
-
-    if (periodRegex.test(enrichedLabel)) {
-      plans.period.push({
-        ...selectMeta,
-        values: validOptions,
-      });
-      continue;
-    }
-
-    plans.generic.push(selectMeta);
+function flattenObject(input, prefix = "", out = {}) {
+  if (input === null || input === undefined) return out;
+  if (typeof input !== "object") {
+    if (prefix) out[prefix] = input;
+    return out;
   }
 
-  log("filtros encontrados", "info", {
-    totalSelects: (filterInfo.selects || []).length,
-    totalDateInputs: (filterInfo.dateInputs || []).length,
-    countryFilters: plans.country.length,
-    periodFilters: plans.period.length,
-    hasPageSize: Boolean(plans.pageSize),
-  });
-
-  return plans;
-}
-
-function uniqueOptions(options) {
-  const dedup = new Map();
-  for (const opt of options || []) {
-    const key = `${String(opt.value || "").trim()}|${String(opt.text || "").trim()}`;
-    if (!dedup.has(key)) dedup.set(key, opt);
-  }
-  return [...dedup.values()];
-}
-
-function isPlaceholderOption(opt) {
-  const txt = `${opt.text || ""} ${opt.value || ""}`.toLowerCase();
-  return /(seleccione|seleccionar|elija|choose|select|--|todos\.\.\.|all\.\.\.)/.test(txt);
-}
-
-function findBroadOption(options) {
-  return (options || []).find((opt) =>
-    /(todos|todas|all|any|general|global|completo|total)/i.test(
-      `${opt.text || ""} ${opt.value || ""}`
-    )
-  );
-}
-
-function chooseEarliestOption(options) {
-  const numeric = options
-    .map((opt) => ({
-      opt,
-      n: Number(String(opt.value || opt.text).replace(/[^\d]/g, "")),
-    }))
-    .filter((x) => Number.isFinite(x.n) && x.n > 0)
-    .sort((a, b) => a.n - b.n);
-  if (numeric.length > 0) return numeric[0].opt;
-  return options[0];
-}
-
-function chooseLatestOption(options) {
-  const numeric = options
-    .map((opt) => ({
-      opt,
-      n: Number(String(opt.value || opt.text).replace(/[^\d]/g, "")),
-    }))
-    .filter((x) => Number.isFinite(x.n) && x.n > 0)
-    .sort((a, b) => a.n - b.n);
-  if (numeric.length > 0) return numeric[numeric.length - 1].opt;
-  return options[options.length - 1];
-}
-
-function buildFilterSets(plans, maxCombos, log) {
-  let sets = [];
-  const base = { selects: [], dates: [] };
-
-  if (plans.pageSize) {
-    base.selects.push({
-      index: plans.pageSize.index,
-      label: plans.pageSize.label,
-      value: plans.pageSize.selectedOption.value || plans.pageSize.selectedOption.text,
-      text: plans.pageSize.selectedOption.text || plans.pageSize.selectedOption.value,
+  if (Array.isArray(input)) {
+    if (input.length === 0 && prefix) out[prefix] = "";
+    input.forEach((val, idx) => {
+      const key = prefix ? `${prefix}[${idx}]` : `[${idx}]`;
+      flattenObject(val, key, out);
     });
+    return out;
   }
 
-  if (plans.dateInputs.length) {
-    for (const dateInput of plans.dateInputs) {
-      const valueFrom = dateInput.min || "1990-01-01";
-      const valueTo = dateInput.max || new Date().toISOString().slice(0, 10);
-      if (/desde|from|inicio/i.test(`${dateInput.label} ${dateInput.name} ${dateInput.id}`)) {
-        base.dates.push({ index: dateInput.index, label: dateInput.label, value: valueFrom });
-      } else if (/hasta|to|fin/i.test(`${dateInput.label} ${dateInput.name} ${dateInput.id}`)) {
-        base.dates.push({ index: dateInput.index, label: dateInput.label, value: valueTo });
-      } else {
-        base.dates.push({ index: dateInput.index, label: dateInput.label, value: valueFrom });
+  for (const [k, v] of Object.entries(input)) {
+    const nextKey = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === "object") {
+      flattenObject(v, nextKey, out);
+    } else {
+      out[nextKey] = v;
+    }
+  }
+  return out;
+}
+
+function extractRecordsFromJsonPayload(payload, sourceUrl) {
+  const records = [];
+  const seen = new Set();
+
+  const scoreObject = (obj) => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return 0;
+    const keys = Object.keys(obj).map((k) => k.toLowerCase());
+    const hasName = keys.some((k) => /(name|empresa|company|razon|consignee|shipper|importador|exportador)/.test(k));
+    const hasCountry = keys.some((k) => /(country|pais|origen|destino)/.test(k));
+    const hasAddress = keys.some((k) => /(address|direccion|ciudad|provincia|city|state)/.test(k));
+    const hasTax = keys.some((k) => /(cuit|tax|vat|id)/.test(k));
+    let score = 0;
+    if (hasName) score += 3;
+    if (hasCountry) score += 2;
+    if (hasAddress) score += 1;
+    if (hasTax) score += 1;
+    return score;
+  };
+
+  const visit = (node) => {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      if (node.length > 0 && typeof node[0] === "object") {
+        for (const item of node) visit(item);
+      }
+      return;
+    }
+    if (typeof node !== "object") return;
+
+    const score = scoreObject(node);
+    if (score >= 2) {
+      const flat = flattenObject(node);
+      const hash = crypto
+        .createHash("sha1")
+        .update(JSON.stringify(flat).slice(0, 5000))
+        .digest("hex");
+      if (!seen.has(hash)) {
+        seen.add(hash);
+        records.push({
+          _source: "api_json",
+          _sourceUrl: sourceUrl,
+          ...flat,
+        });
       }
     }
+
+    for (const value of Object.values(node)) {
+      if (typeof value === "object") visit(value);
+    }
+  };
+
+  visit(payload);
+  return records;
+}
+
+async function captureModuleDiagnostics(page, moduleDef, log) {
+  const screenshotPath = path.join(DATA_DIR, `${moduleDef.debugBaseName}.png`);
+  const htmlPath = path.join(DATA_DIR, `${moduleDef.debugBaseName}.html`);
+
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch((error) => {
+    log("No se pudo guardar screenshot de diagnóstico", "warn", {
+      error: summarizeError(error),
+    });
+  });
+  const html = await page.content().catch(() => "");
+  if (html) {
+    await fs.writeFile(htmlPath, html, "utf8");
   }
 
-  for (const genericFilter of plans.generic || []) {
-    const options = uniqueOptions((genericFilter.values || []).filter((x) => !isPlaceholderOption(x)));
-    const broad = findBroadOption(options);
-    if (broad) {
-      base.selects.push({
-        index: genericFilter.index,
-        label: genericFilter.label,
-        value: broad.value || broad.text,
-        text: broad.text || broad.value,
-      });
+  const domStats = await page
+    .evaluate(() => {
+      const q = (sel) => document.querySelectorAll(sel).length;
+      const visibleButtons = Array.from(
+        document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"], .btn')
+      )
+        .filter((el) => {
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return (
+            style.visibility !== "hidden" &&
+            style.display !== "none" &&
+            rect.width > 0 &&
+            rect.height > 0
+          );
+        })
+        .map((el) => ((el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim()))
+        .filter((t) => t.length > 0)
+        .slice(0, 200);
+
+      return {
+        table: q("table"),
+        tr: q("tr"),
+        input: q("input"),
+        select: q("select"),
+        button: q("button"),
+        roleRow: q('[role="row"]'),
+        agRow: q(".ag-row"),
+        pDatatableRows: q(".p-datatable-tbody tr"),
+        visibleButtons,
+      };
+    })
+    .catch(() => ({
+      table: 0,
+      tr: 0,
+      input: 0,
+      select: 0,
+      button: 0,
+      roleRow: 0,
+      agRow: 0,
+      pDatatableRows: 0,
+      visibleButtons: [],
+    }));
+
+  log("Diagnóstico DOM", "info", domStats);
+  return { screenshotPath, htmlPath, domStats };
+}
+
+async function clickSearchActions(page, log) {
+  const searchRegex = /(buscar|consultar|filtrar|aplicar|search|actualizar|mostrar)/i;
+  const clicked = [];
+
+  for (let i = 0; i < 4; i += 1) {
+    const btn = await findVisibleClickable(page, searchRegex);
+    if (!btn) break;
+    const label = await btn
+      .evaluate((el) => (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim())
+      .catch(() => "boton");
+    try {
+      await Promise.all([
+        page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {}),
+        btn.click({ timeout: 8000 }),
+      ]);
+      clicked.push(label);
+      await waitForSettled(page);
+      await sleep(600);
+    } catch {
+      break;
     }
   }
 
-  for (const periodFilter of plans.period || []) {
-    const options = uniqueOptions((periodFilter.values || []).filter((x) => !isPlaceholderOption(x)));
-    if (!options.length) continue;
+  if (clicked.length > 0) {
+    log("Se ejecutaron acciones de búsqueda", "info", { clicked });
+  } else {
+    log("No se detectaron botones de búsqueda/aplicación");
+  }
+}
 
-    const broad = findBroadOption(options);
-    const label = `${periodFilter.label || ""} ${periodFilter.name || ""} ${periodFilter.id || ""}`;
-    const isFrom = /(desde|from|inicio|inicial|min)/i.test(label);
-    const isTo = /(hasta|to|fin|final|max)/i.test(label);
+async function maximizeRowsPerPage(page, log) {
+  const selects = page.locator("select");
+  const count = await selects.count().catch(() => 0);
+  let changed = 0;
 
-    let selected = broad;
-    if (!selected && isFrom) selected = chooseEarliestOption(options);
-    if (!selected && isTo) selected = chooseLatestOption(options);
-    if (!selected) selected = chooseLatestOption(options);
+  for (let i = 0; i < count; i += 1) {
+    const s = selects.nth(i);
+    const visible = await s.isVisible().catch(() => false);
+    if (!visible) continue;
 
-    base.selects.push({
-      index: periodFilter.index,
-      label: periodFilter.label,
-      value: selected.value || selected.text,
-      text: selected.text || selected.value,
-    });
+    const meta = await s
+      .evaluate((el) => {
+        const label =
+          (el.getAttribute("aria-label") ||
+            el.getAttribute("name") ||
+            el.getAttribute("id") ||
+            "") +
+          " " +
+          (el.closest("label")?.textContent || "");
+        const options = Array.from(el.options || []).map((o) => ({
+          value: o.value,
+          text: (o.textContent || "").trim(),
+        }));
+        return { label: label.trim(), options };
+      })
+      .catch(() => ({ label: "", options: [] }));
+
+    const looksLikePageSize = /(fila|rows|page size|por pagina|por p[aá]gina|cantidad|mostrar|registros|items)/i.test(
+      meta.label
+    );
+    if (!looksLikePageSize) continue;
+
+    const numericOptions = meta.options
+      .map((opt) => ({
+        ...opt,
+        n: Number(String(opt.value || opt.text).replace(/[^\d]/g, "")),
+      }))
+      .filter((x) => Number.isFinite(x.n) && x.n > 0)
+      .sort((a, b) => a.n - b.n);
+
+    if (numericOptions.length === 0) continue;
+    const maxOption = numericOptions[numericOptions.length - 1];
+
+    try {
+      await s.selectOption({ value: String(maxOption.value) }, { timeout: 8000 });
+      changed += 1;
+    } catch {
+      await s.selectOption({ label: String(maxOption.text) }, { timeout: 8000 }).catch(() => {});
+      changed += 1;
+    }
   }
 
-  sets = [{ selects: [...base.selects], dates: [...base.dates] }];
-  for (const countryFilter of plans.country || []) {
-    const allCountryOptions = uniqueOptions(
-      (countryFilter.values || []).filter((x) => !isPlaceholderOption(x))
-    );
-    if (!allCountryOptions.length) continue;
+  if (changed > 0) {
+    log("Selector de filas por página maximizado", "info", { changed });
+    await waitForSettled(page);
+  }
+}
 
-    const broad = findBroadOption(allCountryOptions);
-    const countryValues = allCountryOptions.filter((x) => x !== broad);
-    const valuesToIterate = countryValues.length > 0 ? countryValues : allCountryOptions;
+async function detectFilterCombos(page, log) {
+  const filters = await page
+    .evaluate(() => {
+      const normalize = (v) => (v || "").replace(/\s+/g, " ").trim();
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
+      const arr = [];
+      const selects = Array.from(document.querySelectorAll("select")).filter(visible);
+      selects.forEach((el, idx) => {
+        const label = normalize(
+          el.getAttribute("aria-label") ||
+            el.getAttribute("name") ||
+            el.getAttribute("id") ||
+            el.closest("label")?.textContent ||
+            ""
+        );
+        const options = Array.from(el.options || []).map((o) => ({
+          value: o.value,
+          text: normalize(o.textContent),
+        }));
+        arr.push({ index: idx, label, options });
+      });
+      return arr;
+    })
+    .catch(() => []);
 
-    const nextSets = [];
-    for (const existing of sets) {
-      for (const country of valuesToIterate) {
-        nextSets.push({
+  const eligible = filters
+    .map((f) => {
+      const options = (f.options || []).filter((o) => {
+        const txt = (o.text || "").toLowerCase();
+        return (
+          (isTruthy(o.value) || isTruthy(o.text)) &&
+          !/todos|all|seleccione|select|--|sin filtro/.test(txt)
+        );
+      });
+      return { ...f, options };
+    })
+    .filter((f) => {
+      if ((f.options || []).length <= 1) return false;
+      return /(pais|country|period|fecha|anio|año|mes|origen|destino)/i.test(f.label);
+    })
+    .slice(0, 3);
+
+  if (eligible.length === 0) {
+    log("No se detectaron filtros de país/período útiles");
+    return [{ selects: [] }];
+  }
+
+  let combos = [{ selects: [] }];
+  for (const f of eligible) {
+    const next = [];
+    const limitedOptions = f.options.slice(0, 100);
+    for (const combo of combos) {
+      for (const opt of limitedOptions) {
+        next.push({
           selects: [
-            ...existing.selects,
+            ...combo.selects,
             {
-              index: countryFilter.index,
-              label: countryFilter.label,
-              value: country.value || country.text,
-              text: country.text || country.value,
+              index: f.index,
+              label: f.label,
+              value: opt.value || opt.text,
+              text: opt.text || opt.value,
             },
           ],
-          dates: [...existing.dates],
         });
-        if (nextSets.length >= maxCombos) break;
+        if (next.length >= CONFIG.maxFilterCombos) break;
       }
-      if (nextSets.length >= maxCombos) break;
+      if (next.length >= CONFIG.maxFilterCombos) break;
     }
-    sets = nextSets.length > 0 ? nextSets : sets;
-    if (sets.length >= maxCombos) break;
+    combos = next.length ? next : combos;
+    if (combos.length >= CONFIG.maxFilterCombos) break;
   }
 
-  if (!sets.length) sets = [base];
-  if (sets.length > maxCombos) {
-    log("Combinaciones de filtros truncadas por seguridad", "warn", {
-      requested: sets.length,
-      kept: maxCombos,
-    });
-    return sets.slice(0, maxCombos);
-  }
-  return sets;
+  log("Filtros detectados", "info", {
+    filters: eligible.map((x) => ({ label: x.label, options: x.options.length })),
+    totalCombos: combos.length,
+  });
+  return combos.length ? combos : [{ selects: [] }];
 }
 
-async function applyFilterSet(page, filterSet, log) {
-  for (const sel of filterSet.selects || []) {
+async function applyFilterCombo(page, combo, log) {
+  for (const sel of combo.selects || []) {
     const locator = page.locator("select").nth(sel.index);
-    if (!(await locator.isVisible().catch(() => false))) continue;
+    const visible = await locator.isVisible().catch(() => false);
+    if (!visible) continue;
     try {
-      await locator.selectOption({ value: String(sel.value) }, { timeout: 10000 });
+      await locator.selectOption({ value: String(sel.value) }, { timeout: 8000 });
     } catch {
-      try {
-        await locator.selectOption({ label: String(sel.text) }, { timeout: 10000 });
-      } catch (error) {
-        log("No se pudo aplicar select", "warn", {
-          label: sel.label,
-          value: sel.value,
-          error: summarizeError(error),
-        });
-      }
+      await locator.selectOption({ label: String(sel.text) }, { timeout: 8000 }).catch(() => {});
     }
   }
-
-  for (const date of filterSet.dates || []) {
-    const locator = page
-      .locator('input[type="date"], input[placeholder*="fecha" i]')
-      .nth(date.index);
-    if (!(await locator.isVisible().catch(() => false))) continue;
-    await locator.fill(date.value).catch((error) => {
-      log("No se pudo completar fecha", "warn", {
-        label: date.label,
-        value: date.value,
-        error: summarizeError(error),
-      });
-    });
-  }
-
-  const applyBtn = await findFirstClickableByRegex(
-    page,
-    /(buscar|aplicar|filtrar|consultar|actualizar|mostrar|search)/i
-  );
-  if (applyBtn) {
-    await applyBtn.click({ timeout: 10000 }).catch(() => {});
-  }
-
-  await waitForPageSettled(page);
+  await clickSearchActions(page, log);
+  await waitForSettled(page);
 }
 
-async function findNativeExportButton(page) {
-  return findFirstClickableByRegex(page, /(export|excel|csv|descargar|download|reporte)/i);
+function extractRelevantRequests(networkEvents) {
+  const keywordRegex = /(import|export|detalle|search|data|grid|formulario)/i;
+  return networkEvents
+    .filter((e) => keywordRegex.test(e.url))
+    .map((e) => ({
+      ts: e.ts,
+      method: e.method,
+      status: e.status,
+      url: e.url,
+      contentType: e.contentType,
+      parsedRecords: (e.parsedRecords || []).length,
+    }));
 }
 
-async function downloadNativeExport(page, moduleKey, filterSet, fileIndex, log) {
-  const button = await findNativeExportButton(page);
+async function detectNativeExport(page) {
+  return findVisibleClickable(page, /(export|excel|csv|descargar|download|reporte)/i);
+}
+
+async function runNativeExport(page, moduleDef, comboTag, log) {
+  const button = await detectNativeExport(page);
   if (!button) return null;
+  const filePrefix = `${moduleDef.key}_native_${safeSlug(comboTag || "base")}`;
 
-  const tag = (filterSet.selects || [])
-    .map((s) => safeSlug(`${s.label}_${s.text || s.value}`))
-    .join("__");
-
-  const prefix = tag ? `${moduleKey}__${tag}` : moduleKey;
-  let download = await Promise.all([
-    page.waitForEvent("download", { timeout: 20000 }),
+  const download = await Promise.all([
+    page.waitForEvent("download", { timeout: 25000 }),
     button.click({ timeout: 8000 }),
   ])
     .then(([dl]) => dl)
     .catch(() => null);
 
-  if (!download) {
-    const secondChance = await findFirstClickableByRegex(
-      page,
-      /(excel|csv|descargar|download|reporte|export)/i
-    );
-    if (secondChance) {
-      download = await Promise.all([
-        page.waitForEvent("download", { timeout: 20000 }),
-        secondChance.click({ timeout: 8000 }),
-      ])
-        .then(([dl]) => dl)
-        .catch(() => null);
-    }
-  }
   if (!download) return null;
-
   const ext = path.extname(download.suggestedFilename() || "") || ".dat";
-  const dest = path.join(DATA_DIR, `${prefix}__${fileIndex}${ext}`);
-  await download.saveAs(dest);
-  log("Exportación nativa descargada", "info", { file: dest });
-  return dest;
+  const outPath = path.join(DATA_DIR, `${filePrefix}${ext}`);
+  await download.saveAs(outPath);
+  log("Exportación nativa descargada", "info", { outPath });
+  return outPath;
 }
 
-async function parseNativeFile(filePath, log) {
+async function parseNativeFileToRows(filePath, moduleDef, log) {
   const ext = path.extname(filePath).toLowerCase();
   if (![".xlsx", ".csv"].includes(ext)) {
-    log("Formato nativo no parseable por script (se conserva archivo)", "warn", { filePath });
+    log("Archivo nativo no parseable (se conserva)", "warn", { filePath });
     return [];
   }
 
@@ -670,295 +653,368 @@ async function parseNativeFile(filePath, log) {
   } else {
     await workbook.csv.readFile(filePath);
   }
-  const worksheet = workbook.worksheets[0];
-  if (!worksheet) return [];
+  const ws = workbook.worksheets[0];
+  if (!ws) return [];
 
-  const headerRow = worksheet.getRow(1);
-  const headers = headerRow.values
-    .slice(1)
-    .map((v, i) => (isTruthyString(v) ? String(v).trim() : `col_${i + 1}`));
+  const headers = ws
+    .getRow(1)
+    .values.slice(1)
+    .map((h, i) => (isTruthy(h) ? String(h).trim() : `col_${i + 1}`));
+
   const rows = [];
-
-  worksheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-    const values = row.values.slice(1);
-    if (!values.some((v) => isTruthyString(v) || typeof v === "number")) return;
-    const out = {};
+  ws.eachRow((row, rowNum) => {
+    if (rowNum === 1) return;
+    const vals = row.values.slice(1);
+    if (!vals.some((v) => isTruthy(v) || typeof v === "number")) return;
+    const obj = {};
     for (let i = 0; i < headers.length; i += 1) {
-      out[headers[i]] = values[i] ?? "";
+      obj[headers[i]] = vals[i] ?? "";
     }
-    rows.push(out);
+    obj._source = "native_export";
+    obj._module = moduleDef.key;
+    rows.push(obj);
   });
-
   return rows;
 }
 
-async function extractRowsFromPage(page, moduleKey, filterLabel, pageNumber) {
+async function extractDomRows(page, moduleDef, comboLabel, pageNo) {
   return page.evaluate(
-    ({ moduleKeyArg, filterLabelArg, pageNumberArg }) => {
-      const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
+    ({ moduleKey, companyType, comboLabelArg, pageNoArg }) => {
+      const norm = (t) => (t || "").replace(/\s+/g, " ").trim();
       const visible = (el) => {
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        return (
-          style &&
-          style.visibility !== "hidden" &&
-          style.display !== "none" &&
-          rect.width > 0 &&
-          rect.height > 0
-        );
+        const s = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return s.visibility !== "hidden" && s.display !== "none" && r.width > 0 && r.height > 0;
       };
 
-      const collected = [];
-      const tables = Array.from(document.querySelectorAll("table")).filter(visible);
+      const rows = [];
 
-      for (let tableIndex = 0; tableIndex < tables.length; tableIndex += 1) {
-        const table = tables[tableIndex];
-        const headers = Array.from(table.querySelectorAll("thead th")).map((th, i) => {
-          const txt = normalize(th.textContent);
-          return txt || `col_${i + 1}`;
-        });
-
-        const bodyRows = Array.from(table.querySelectorAll("tbody tr")).filter(visible);
-        for (const tr of bodyRows) {
-          const cells = Array.from(tr.querySelectorAll("td"));
-          if (!cells.length) continue;
-          const row = {
-            _module: moduleKeyArg,
-            _filter: filterLabelArg,
-            _page: pageNumberArg,
-            _table: tableIndex + 1,
-          };
-          for (let i = 0; i < cells.length; i += 1) {
-            const key = headers[i] || `col_${i + 1}`;
-            row[key] = normalize(cells[i].innerText || cells[i].textContent);
-          }
-          const anchor = tr.querySelector("a[href]");
-          if (anchor) row._detail_href = anchor.getAttribute("href") || "";
-          collected.push(row);
+      const pushRow = (raw, sourceKind) => {
+        const output = {
+          _source: sourceKind,
+          _module: moduleKey,
+          _companyType: companyType,
+          _filter: comboLabelArg,
+          _page: pageNoArg,
+        };
+        for (const [k, v] of Object.entries(raw)) {
+          const key = norm(k) || "col";
+          output[key] = norm(v);
         }
-      }
+        rows.push(output);
+      };
 
-      if (collected.length > 0) return collected;
+      // HTML tables
+      const tables = Array.from(document.querySelectorAll("table")).filter(visible);
+      tables.forEach((table, tIdx) => {
+        const headers = Array.from(table.querySelectorAll("thead th")).map(
+          (th, i) => norm(th.textContent) || `col_${i + 1}`
+        );
+        const trs = Array.from(table.querySelectorAll("tbody tr")).filter(visible);
+        trs.forEach((tr) => {
+          const tds = Array.from(tr.querySelectorAll("td"));
+          if (!tds.length) return;
+          const raw = { _table: tIdx + 1 };
+          tds.forEach((td, idx) => {
+            raw[headers[idx] || `col_${idx + 1}`] = norm(td.innerText || td.textContent);
+          });
+          const detailAnchor = tr.querySelector("a[href]");
+          if (detailAnchor) raw._detailHref = detailAnchor.getAttribute("href") || "";
+          pushRow(raw, "dom_table");
+        });
+      });
 
+      // role=row grids
       const roleRows = Array.from(document.querySelectorAll('[role="row"]')).filter(visible);
       if (roleRows.length > 1) {
-        const headerCandidates = Array.from(roleRows[0].querySelectorAll('[role="columnheader"]'));
-        const headers = headerCandidates.map((h, i) => normalize(h.textContent) || `col_${i + 1}`);
+        const headerCells = Array.from(
+          roleRows[0].querySelectorAll('[role="columnheader"], .ag-header-cell-text')
+        );
+        const headers = headerCells.map((h, i) => norm(h.textContent) || `col_${i + 1}`);
         for (let i = 1; i < roleRows.length; i += 1) {
           const rr = roleRows[i];
-          const cells = Array.from(rr.querySelectorAll('[role="gridcell"], [role="cell"]'));
+          const cells = Array.from(
+            rr.querySelectorAll('[role="gridcell"], [role="cell"], .ag-cell, .p-datatable-tbody td')
+          );
           if (!cells.length) continue;
-          const row = {
-            _module: moduleKeyArg,
-            _filter: filterLabelArg,
-            _page: pageNumberArg,
-            _table: 1,
-          };
-          for (let c = 0; c < cells.length; c += 1) {
-            const key = headers[c] || `col_${c + 1}`;
-            row[key] = normalize(cells[c].textContent);
-          }
-          const anchor = rr.querySelector("a[href]");
-          if (anchor) row._detail_href = anchor.getAttribute("href") || "";
-          collected.push(row);
+          const raw = {};
+          cells.forEach((cell, idx) => {
+            raw[headers[idx] || `col_${idx + 1}`] = norm(cell.innerText || cell.textContent);
+          });
+          const detailAnchor = rr.querySelector("a[href]");
+          if (detailAnchor) raw._detailHref = detailAnchor.getAttribute("href") || "";
+          pushRow(raw, "dom_role_grid");
         }
       }
 
-      return collected;
+      // ag-grid fallback by row/cell classes
+      const agRows = Array.from(document.querySelectorAll(".ag-row")).filter(visible);
+      if (agRows.length) {
+        agRows.forEach((r) => {
+          const cells = Array.from(r.querySelectorAll(".ag-cell"));
+          if (!cells.length) return;
+          const raw = {};
+          cells.forEach((c, idx) => {
+            raw[`ag_col_${idx + 1}`] = norm(c.innerText || c.textContent);
+          });
+          pushRow(raw, "dom_ag_grid");
+        });
+      }
+
+      // PrimeNG fallback
+      const pRows = Array.from(document.querySelectorAll(".p-datatable-tbody tr")).filter(visible);
+      if (pRows.length) {
+        pRows.forEach((tr) => {
+          const tds = Array.from(tr.querySelectorAll("td"));
+          if (!tds.length) return;
+          const raw = {};
+          tds.forEach((td, idx) => {
+            raw[`p_col_${idx + 1}`] = norm(td.innerText || td.textContent);
+          });
+          pushRow(raw, "dom_primeng");
+        });
+      }
+
+      // Generic div row-like fallback
+      const divRows = Array.from(
+        document.querySelectorAll(
+          '.row, .grid-row, .table-row, [class*="row"], [data-row-index], [data-testid*="row"]'
+        )
+      )
+        .filter(visible)
+        .slice(0, 2000);
+      if (divRows.length && rows.length === 0) {
+        divRows.forEach((r) => {
+          const txt = norm(r.innerText || r.textContent);
+          if (!txt || txt.length < 3) return;
+          pushRow({ rawText: txt }, "dom_div_grid");
+        });
+      }
+
+      return rows;
     },
-    { moduleKeyArg: moduleKey, filterLabelArg: filterLabel, pageNumberArg: pageNumber }
-  );
-}
-
-async function getRowsCount(page) {
-  const tableRows = await page.locator("table tbody tr:visible").count().catch(() => 0);
-  if (tableRows > 0) return tableRows;
-  const roleRows = await page.locator('[role="row"]:visible').count().catch(() => 0);
-  return roleRows;
-}
-
-async function getDataSignature(page) {
-  return page.evaluate(() => {
-    const rows = Array.from(document.querySelectorAll("table tbody tr")).slice(0, 3);
-    const txt = rows
-      .map((r) => (r.innerText || "").replace(/\s+/g, " ").trim())
-      .join("||");
-    return `${window.location.href}::${txt}`;
-  });
-}
-
-async function tryAdvancePagination(page, log) {
-  const signatureBefore = await getDataSignature(page).catch(() => "");
-  const rowsBefore = await getRowsCount(page).catch(() => 0);
-
-  const loadMore = await findFirstClickableByRegex(
-    page,
-    /(cargar m[aá]s|mostrar m[aá]s|load more|ver m[aá]s)/i
-  );
-  if (loadMore) {
-    await loadMore.click({ timeout: 10000 }).catch(() => {});
-    await waitForPageSettled(page);
-    const rowsAfter = await getRowsCount(page).catch(() => 0);
-    if (rowsAfter > rowsBefore) {
-      log("Paginación por load more detectada", "info", { rowsBefore, rowsAfter });
-      return true;
+    {
+      moduleKey: moduleDef.key,
+      companyType: moduleDef.companyType,
+      comboLabelArg: comboLabel,
+      pageNoArg: pageNo,
     }
-  }
-
-  const nextButton = await findFirstClickableByRegex(
-    page,
-    /(siguiente|next|proxima|pr[oó]xima|›|»)/i
   );
-  if (nextButton) {
-    await nextButton.click({ timeout: 10000 }).catch(() => {});
-    await waitForPageSettled(page);
-    const signatureAfter = await getDataSignature(page).catch(() => "");
-    if (signatureAfter && signatureAfter !== signatureBefore) {
-      return true;
-    }
-  }
+}
 
-  const rowsAfterScrollAttempt = await getRowsCount(page).catch(() => rowsBefore);
-  await page.mouse.wheel(0, 2500).catch(() => {});
-  await waitForPageSettled(page);
-  const rowsAfterScroll = await getRowsCount(page).catch(() => rowsAfterScrollAttempt);
-  if (rowsAfterScroll > rowsAfterScrollAttempt) {
-    log("Paginación/infinite scroll detectada", "info", {
-      rowsAfterScrollAttempt,
-      rowsAfterScroll,
+async function openDetailIfAnyAndExtract(page, context, row, log) {
+  const href = row._detailHref || row._detail_href || row.detailHref;
+  if (!isTruthy(href)) return row;
+
+  let absolute = String(href);
+  if (!absolute.startsWith("http")) {
+    absolute = `${CONFIG.baseUrl}${absolute.startsWith("/") ? "" : "/"}${absolute}`;
+  }
+  if (!absolute.startsWith(CONFIG.baseUrl)) return row;
+
+  const p = await context.newPage();
+  p.setDefaultTimeout(CONFIG.timeoutMs);
+  try {
+    await p.goto(absolute, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
+    await waitForSettled(p);
+    const detail = await p.evaluate(() => {
+      const norm = (t) => (t || "").replace(/\s+/g, " ").trim();
+      const out = {};
+      document.querySelectorAll("dt").forEach((dt) => {
+        const dd = dt.nextElementSibling;
+        if (dd && dd.tagName.toLowerCase() === "dd") {
+          const k = norm(dt.textContent);
+          if (k) out[`detail_${k}`] = norm(dd.textContent);
+        }
+      });
+      document.querySelectorAll("label").forEach((lb) => {
+        const k = norm(lb.textContent);
+        if (!k || out[`detail_${k}`]) return;
+        const sib = lb.nextElementSibling;
+        if (sib) out[`detail_${k}`] = norm(sib.textContent);
+      });
+      return out;
     });
+    await p.close();
+    return { ...row, ...detail, _detailUrl: absolute };
+  } catch (error) {
+    await p.close();
+    log("No se pudo extraer detalle de registro", "warn", {
+      href: absolute,
+      error: summarizeError(error),
+    });
+    return row;
+  }
+}
+
+async function advancePagination(page, log) {
+  const signatureBefore = await page
+    .evaluate(() => {
+      const snap = Array.from(document.querySelectorAll("table tbody tr, .ag-row, .p-datatable-tbody tr"))
+        .slice(0, 5)
+        .map((n) => (n.innerText || "").replace(/\s+/g, " ").trim())
+        .join("||");
+      return `${window.location.href}::${snap}`;
+    })
+    .catch(() => "");
+
+  const loadMore = await findVisibleClickable(page, /(cargar m[aá]s|mostrar m[aá]s|load more|ver m[aá]s)/i);
+  if (loadMore) {
+    await loadMore.click({ timeout: 8000 }).catch(() => {});
+    await waitForSettled(page);
+    return true;
+  }
+
+  const next = await findVisibleClickable(page, /(siguiente|next|pr[oó]xima|›|»)/i);
+  if (next) {
+    await next.click({ timeout: 8000 }).catch(() => {});
+    await waitForSettled(page);
+    const signatureAfter = await page
+      .evaluate(() => {
+        const snap = Array.from(document.querySelectorAll("table tbody tr, .ag-row, .p-datatable-tbody tr"))
+          .slice(0, 5)
+          .map((n) => (n.innerText || "").replace(/\s+/g, " ").trim())
+          .join("||");
+        return `${window.location.href}::${snap}`;
+      })
+      .catch(() => "");
+    if (signatureAfter !== signatureBefore) return true;
+  }
+
+  const beforeCount = await page
+    .locator("table tbody tr, .ag-row, .p-datatable-tbody tr, [role='row']")
+    .count()
+    .catch(() => 0);
+  await page.mouse.wheel(0, 2200).catch(() => {});
+  await sleep(600);
+  await waitForSettled(page);
+  const afterCount = await page
+    .locator("table tbody tr, .ag-row, .p-datatable-tbody tr, [role='row']")
+    .count()
+    .catch(() => beforeCount);
+  if (afterCount > beforeCount) {
+    log("Infinite scroll detectado", "info", { beforeCount, afterCount });
     return true;
   }
 
   return false;
 }
 
-async function extractDetailsFromHref(context, href, log) {
-  if (!isTruthyString(href)) return {};
-  const absolute = href.startsWith("http") ? href : `${CONFIG.baseUrl}${href.startsWith("/") ? "" : "/"}${href}`;
-  if (!absolute.startsWith(CONFIG.baseUrl)) return {};
-
-  const detailPage = await context.newPage();
-  detailPage.setDefaultTimeout(CONFIG.timeoutMs);
-
-  try {
-    await detailPage.goto(absolute, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
-    await waitForPageSettled(detailPage);
-    const detail = await detailPage.evaluate(() => {
-      const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
-      const out = {};
-
-      const dtNodes = Array.from(document.querySelectorAll("dt"));
-      for (const dt of dtNodes) {
-        const dd = dt.nextElementSibling;
-        if (dd && dd.tagName.toLowerCase() === "dd") {
-          const key = normalize(dt.textContent);
-          const value = normalize(dd.textContent);
-          if (key) out[`detail_${key}`] = value;
-        }
-      }
-
-      const labels = Array.from(document.querySelectorAll("label"));
-      for (const lbl of labels) {
-        const key = normalize(lbl.textContent);
-        if (!key || out[`detail_${key}`]) continue;
-        const sibling = lbl.nextElementSibling;
-        if (sibling) {
-          out[`detail_${key}`] = normalize(sibling.textContent);
-        }
-      }
-
-      return out;
-    });
-    await detailPage.close();
-    return detail;
-  } catch (error) {
-    await detailPage.close();
-    log("No se pudo extraer detalle individual", "warn", {
-      href: absolute,
-      error: summarizeError(error),
-    });
-    return {};
+function getValueByKeyPatterns(raw, patterns) {
+  const entries = Object.entries(raw || {});
+  for (const [key, value] of entries) {
+    const lk = key.toLowerCase();
+    if (patterns.some((p) => p.test(lk)) && isTruthy(value)) {
+      return String(value).trim();
+    }
   }
+  return "";
 }
 
-async function manualScrapeAll(page, context, moduleKey, filterSet, log) {
-  const seen = new Set();
-  const allRows = [];
-  let pagesTraversed = 0;
+function normalizeRecord(raw, moduleDef, sourceUrl) {
+  const name = getValueByKeyPatterns(raw, [
+    /^(name|nombre|empresa|razon|raz[oó]n|consignee|shipper|importador|exportador)$/,
+    /(name|nombre|empresa|razon|consignee|shipper|importador|exportador)/,
+  ]);
+  const country = getValueByKeyPatterns(raw, [/(country|pais|pa[ií]s|origen|destino)/]);
+  const city = getValueByKeyPatterns(raw, [/(city|ciudad|localidad)/]);
+  const province = getValueByKeyPatterns(raw, [/(province|provincia|state|estado)/]);
+  const address = getValueByKeyPatterns(raw, [/(address|direccion|domicilio|street|calle)/]);
+  const taxId = getValueByKeyPatterns(raw, [/(cuit|tax|vat|fiscal|taxid|tax_id|id tributaria)/]);
+  const contact = getValueByKeyPatterns(raw, [/(contact|contacto|responsable|attn|persona)/]);
+  const phone = getValueByKeyPatterns(raw, [/(phone|telefono|tel|celular|mobile)/]);
+  const email = getValueByKeyPatterns(raw, [/(email|correo|mail|e-mail)/]);
 
-  const filterLabel = (filterSet.selects || [])
-    .map((s) => `${s.label || "filtro"}=${s.text || s.value}`)
-    .join(" | ") || "sin_filtro";
+  if (!name && !taxId) return null;
 
-  for (;;) {
-    pagesTraversed += 1;
-    if (pagesTraversed > CONFIG.maxPagesPerFilterSet) {
-      log("Corte de seguridad por exceso de páginas", "warn", {
-        limit: CONFIG.maxPagesPerFilterSet,
-      });
-      break;
-    }
-    log("Página actual", "info", { page: pagesTraversed, filterLabel });
-
-    const rows = await extractRowsFromPage(page, moduleKey, filterLabel, pagesTraversed).catch(() => []);
-    for (const row of rows) {
-      const hash = row.id || row.ID || row._id || hashRow(row);
-      if (seen.has(hash)) continue;
-
-      if (row._detail_href) {
-        const detail = await extractDetailsFromHref(context, row._detail_href, log);
-        Object.assign(row, detail);
-      }
-
-      seen.add(hash);
-      allRows.push(row);
-    }
-
-    log("registros acumulados", "info", { total: allRows.length });
-    const moved = await tryAdvancePagination(page, log);
-    if (!moved) break;
-  }
-
-  return { rows: allRows, pagesTraversed };
+  return {
+    name: name || "",
+    companyType: moduleDef.companyType,
+    country: country || "",
+    city: city || "",
+    province: province || "",
+    address: address || "",
+    taxId: taxId || "",
+    contact: contact || "",
+    phone: phone || "",
+    email: email || "",
+    sourceModule: moduleDef.key,
+    sourceUrl,
+    extractedAt: nowIso(),
+    _raw: raw,
+  };
 }
 
-async function writeExcelAndJson(moduleKey, rows, metadata, logs) {
-  const jsonPath = path.join(DATA_DIR, `${moduleKey}.json`);
-  const xlsxPath = path.join(DATA_DIR, `${moduleKey}.xlsx`);
+function dedupeNormalized(records) {
+  const out = new Map();
+  for (const r of records) {
+    if (!r) continue;
+    const base = `${(r.name || "").toLowerCase().trim()}|${(r.country || "").toLowerCase().trim()}`;
+    const key = r.taxId ? `${base}|tax:${String(r.taxId).toLowerCase().trim()}` : base;
+    if (!out.has(key)) {
+      out.set(key, r);
+    } else {
+      const prev = out.get(key);
+      const merged = { ...prev };
+      for (const [k, v] of Object.entries(r)) {
+        if (!isTruthy(merged[k]) && isTruthy(v)) merged[k] = v;
+      }
+      out.set(key, merged);
+    }
+  }
+  return [...out.values()];
+}
 
-  await fs.writeFile(jsonPath, JSON.stringify(rows, null, 2), "utf8");
+async function writeMasterOutputs(records, metadata, logs) {
+  const jsonPath = path.join(DATA_DIR, "consignees_shippers_master.json");
+  const xlsxPath = path.join(DATA_DIR, "consignees_shippers_master.xlsx");
+  const csvPath = path.join(DATA_DIR, "consignees_shippers_master.csv");
+
+  await fs.writeFile(jsonPath, JSON.stringify({ metadata, records }, null, 2), "utf8");
 
   const workbook = new ExcelJS.Workbook();
   const dataSheet = workbook.addWorksheet("data");
-  const metaSheet = workbook.addWorksheet("metadata");
+  const metadataSheet = workbook.addWorksheet("metadata");
   const logsSheet = workbook.addWorksheet("logs");
 
-  const columns = [...new Set(rows.flatMap((r) => Object.keys(r)))];
-  dataSheet.columns = columns.map((col) => ({ header: col, key: col, width: 18 }));
-  for (const row of rows) dataSheet.addRow(row);
+  const columns = [
+    "name",
+    "companyType",
+    "country",
+    "city",
+    "province",
+    "address",
+    "taxId",
+    "contact",
+    "phone",
+    "email",
+    "sourceModule",
+    "sourceUrl",
+    "extractedAt",
+  ];
 
+  dataSheet.columns = columns.map((c) => ({ header: c, key: c, width: 24 }));
+  records.forEach((r) => dataSheet.addRow(r));
   dataSheet.views = [{ state: "frozen", ySplit: 1 }];
   dataSheet.autoFilter = {
     from: { row: 1, column: 1 },
-    to: { row: 1, column: Math.max(columns.length, 1) },
+    to: { row: 1, column: columns.length },
   };
-  dataSheet.columns.forEach((column) => {
-    let maxLen = String(column.header || "").length;
-    column.eachCell({ includeEmpty: true }, (cell) => {
-      const val = cell.value == null ? "" : String(cell.value);
-      if (val.length > maxLen) maxLen = val.length;
+  dataSheet.columns.forEach((col) => {
+    let max = String(col.header).length;
+    col.eachCell({ includeEmpty: true }, (cell) => {
+      const len = String(cell.value ?? "").length;
+      if (len > max) max = len;
     });
-    column.width = Math.min(Math.max(maxLen + 2, 12), 60);
+    col.width = Math.min(Math.max(max + 2, 14), 60);
   });
 
-  metaSheet.columns = [
-    { header: "campo", key: "campo", width: 38 },
+  metadataSheet.columns = [
+    { header: "campo", key: "campo", width: 40 },
     { header: "valor", key: "valor", width: 120 },
   ];
   Object.entries(metadata).forEach(([campo, valor]) => {
-    metaSheet.addRow({
+    metadataSheet.addRow({
       campo,
       valor: typeof valor === "string" ? valor : JSON.stringify(valor),
     });
@@ -967,157 +1023,152 @@ async function writeExcelAndJson(moduleKey, rows, metadata, logs) {
   logsSheet.columns = [
     { header: "timestamp", key: "ts", width: 28 },
     { header: "level", key: "level", width: 10 },
-    { header: "module", key: "module", width: 30 },
-    { header: "message", key: "message", width: 70 },
+    { header: "scope", key: "scope", width: 26 },
+    { header: "message", key: "message", width: 80 },
     { header: "extra", key: "extra", width: 120 },
   ];
-  logs.forEach((entry) => logsSheet.addRow(entry));
+  logs.forEach((l) => logsSheet.addRow(l));
 
   await workbook.xlsx.writeFile(xlsxPath);
-  return { jsonPath, xlsxPath };
+
+  const csvWorkbook = new ExcelJS.Workbook();
+  const csvSheet = csvWorkbook.addWorksheet("master");
+  csvSheet.columns = columns.map((c) => ({ header: c, key: c }));
+  records.forEach((r) => csvSheet.addRow(r));
+  await csvWorkbook.csv.writeFile(csvPath);
+
+  return { jsonPath, xlsxPath, csvPath };
 }
 
-async function navigateToModule(page, moduleDef, log) {
-  for (const candidate of moduleDef.candidates) {
-    const url = `${CONFIG.baseUrl}${candidate.startsWith("/") ? "" : "/"}${candidate}`;
-    try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
-      await maybeLogin(page, log);
-      await waitForPageSettled(page);
-      log("módulo detectado", "info", { url });
-      return url;
-    } catch (error) {
-      log("Ruta candidata no disponible", "warn", {
-        url,
-        error: summarizeError(error),
-      });
-    }
-  }
+async function processModule(page, context, moduleDef, globalLogs) {
+  const log = makeLogger(moduleDef.key, globalLogs);
+  const moduleUrl = `${CONFIG.baseUrl}${moduleDef.urlPath}`;
+  const moduleRawRows = [];
+  const moduleNormalized = [];
+  const usedMechanisms = new Set();
+  const moduleErrors = [];
 
-  const menuItem = await findFirstClickableByRegex(page, moduleDef.menuRegex);
-  if (menuItem) {
-    await menuItem.click({ timeout: 10000 });
-    await waitForPageSettled(page);
-    const current = page.url();
-    log("módulo detectado por menú/tab", "info", { url: current });
-    return current;
-  }
+  log("Navegando módulo", "info", { moduleUrl });
+  await page.goto(moduleUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
+  await maybeLogin(page, log);
+  await waitForSettled(page);
 
-  throw new Error(`No se pudo navegar al módulo ${moduleDef.key}`);
-}
+  const networkCollector = createNetworkCollector(page, log);
+  await clickSearchActions(page, log);
+  await maximizeRowsPerPage(page, log);
+  await clickSearchActions(page, log);
+  await waitForSettled(page);
 
-async function processModule(page, context, moduleDef) {
-  const moduleLogs = [];
-  const errors = [];
-  const nativeDownloads = [];
-  const log = createLogger(moduleDef.key, moduleLogs);
+  const diagnostics = await captureModuleDiagnostics(page, moduleDef, log);
 
-  const result = {
-    moduleKey: moduleDef.key,
-    rows: [],
-    pagesTraversed: 0,
-    extractionMode: "manual",
-    filtersFound: {},
-    filtersUsed: [],
-    nativeDownloads,
-    errors,
-    logs: moduleLogs,
-  };
+  const filterCombos = await detectFilterCombos(page, log);
+  let nativeDownloadCount = 0;
 
-  try {
-    await navigateToModule(page, moduleDef, log);
-    await maybeOpenAdvancedSearch(page, log);
+  for (let comboIdx = 0; comboIdx < filterCombos.length; comboIdx += 1) {
+    const combo = filterCombos[comboIdx];
+    const comboLabel =
+      (combo.selects || [])
+        .map((s) => `${s.label || "filter"}=${s.text || s.value}`)
+        .join(" | ") || "sin_filtro";
 
-    const filters = await detectFilters(page, log);
-    result.filtersFound = filters;
+    log("Aplicando filtro", "info", { comboIdx: comboIdx + 1, comboLabel });
+    await applyFilterCombo(page, combo, log);
 
-    const filterSets = buildFilterSets(filters, CONFIG.maxFilterCombos, log);
-    if (filterSets.length === 0) filterSets.push({ selects: [], dates: [] });
-    result.filtersUsed = filterSets.map((set) => ({
-      selects: set.selects?.map((s) => ({ label: s.label, value: s.value, text: s.text })) || [],
-      dates: set.dates || [],
-    }));
-
-    const hasNativeExport = Boolean(await findNativeExportButton(page));
-    log(
-      hasNativeExport
-        ? "exportación nativa encontrada"
-        : "exportación nativa no encontrada"
-    );
-
-    if (hasNativeExport) {
-      result.extractionMode = "native_export";
-      let index = 1;
-      for (const filterSet of filterSets) {
-        await applyFilterSet(page, filterSet, log);
-        const downloaded = await retry(
-          () => downloadNativeExport(page, moduleDef.key, filterSet, index, log),
-          {
-            retries: 2,
-            delayMs: 1500,
-            actionName: "downloadNativeExport",
-            onRetry: (attempt, error) =>
-              log("Reintento de exportación nativa", "warn", {
-                attempt,
-                error: summarizeError(error),
-              }),
-          }
-        ).catch((error) => {
-          errors.push(`native_export_filter_${index}: ${summarizeError(error)}`);
-          return null;
-        });
-        if (downloaded) nativeDownloads.push(downloaded);
-        index += 1;
+    // Intento exportación nativa por combinación.
+    const nativePath = await retry(
+      async () => runNativeExport(page, moduleDef, `${comboIdx + 1}_${comboLabel}`, log),
+      {
+        retries: 2,
+        delayMs: 1200,
+        actionName: "runNativeExport",
+        onRetry: (attempt, err) =>
+          log("Reintento exportación nativa", "warn", {
+            attempt,
+            error: summarizeError(err),
+          }),
       }
+    ).catch(() => null);
 
-      for (const file of nativeDownloads) {
-        const parsed = await parseNativeFile(file, log).catch((error) => {
-          errors.push(`parse_native_${path.basename(file)}: ${summarizeError(error)}`);
+    if (nativePath) {
+      usedMechanisms.add("native_export");
+      nativeDownloadCount += 1;
+      const parsedRows = await parseNativeFileToRows(nativePath, moduleDef, log).catch((error) => {
+        moduleErrors.push(`parse_native: ${summarizeError(error)}`);
+        return [];
+      });
+      moduleRawRows.push(...parsedRows);
+    }
+
+    // Si no hubo datos de export nativa, o vino vacía, recorrer DOM + paginación.
+    if (!nativePath || moduleRawRows.length === 0) {
+      let pageNo = 1;
+      let pagesVisited = 0;
+      while (pagesVisited < CONFIG.maxPagesPerModule) {
+        pagesVisited += 1;
+        log("Extrayendo grilla DOM", "info", { comboLabel, pageNo });
+        const rows = await extractDomRows(page, moduleDef, comboLabel, pageNo).catch((error) => {
+          moduleErrors.push(`extract_dom: ${summarizeError(error)}`);
           return [];
         });
-        result.rows.push(...parsed);
-      }
-    }
 
-    if (result.rows.length === 0) {
-      result.extractionMode = "manual_scraping";
-      for (const filterSet of filterSets) {
-        await applyFilterSet(page, filterSet, log);
-        const partial = await manualScrapeAll(
-          page,
-          context,
-          moduleDef.key,
-          filterSet,
-          log
-        ).catch((error) => {
-          errors.push(`manual_scrape: ${summarizeError(error)}`);
-          return { rows: [], pagesTraversed: 0 };
-        });
-        result.rows.push(...partial.rows);
-        result.pagesTraversed += partial.pagesTraversed;
+        for (const row of rows) {
+          const withDetail = await openDetailIfAnyAndExtract(page, context, row, log);
+          moduleRawRows.push(withDetail);
+        }
+
+        const moved = await advancePagination(page, log);
+        if (!moved) break;
+        pageNo += 1;
       }
+      if (moduleRawRows.length > 0) usedMechanisms.add("dom_grid");
     }
-  } catch (error) {
-    errors.push(summarizeError(error));
-    log("Error procesando módulo", "error", { error: summarizeError(error) });
-    await saveDebugArtifacts(page, `${moduleDef.key}_failure`, log);
   }
 
-  const dedup = new Map();
-  for (const row of result.rows) {
-    const id = row.id || row.ID || row._id || hashRow(row);
-    if (!dedup.has(id)) dedup.set(id, row);
+  // Si sigue vacío, última chance: usar eventos de red parseados.
+  const networkEvents = networkCollector.getAll();
+  networkCollector.stop();
+  const apiRows = networkEvents.flatMap((e) => e.parsedRecords || []);
+  if (apiRows.length > 0) {
+    usedMechanisms.add("api_json");
+    moduleRawRows.push(...apiRows.map((r) => ({ ...r, _module: moduleDef.key })));
   }
-  result.rows = [...dedup.values()];
-  return result;
+
+  // Normalización
+  for (const raw of moduleRawRows) {
+    const normalized = normalizeRecord(raw, moduleDef, moduleUrl);
+    if (normalized) moduleNormalized.push(normalized);
+  }
+
+  log("Resumen módulo", "info", {
+    rawRows: moduleRawRows.length,
+    normalizedRows: moduleNormalized.length,
+    nativeDownloadCount,
+    mechanisms: [...usedMechanisms],
+  });
+
+  if (moduleNormalized.length === 0) {
+    moduleErrors.push("Sin registros normalizados tras agotar export nativa + API + DOM");
+    log("Módulo sin datos tras agotar estrategias", "warn");
+  }
+
+  return {
+    module: moduleDef.key,
+    moduleUrl,
+    rawRows: moduleRawRows,
+    normalizedRows: moduleNormalized,
+    diagnostics,
+    usedMechanisms: [...usedMechanisms],
+    relevantRequests: extractRelevantRequests(networkEvents),
+    errors: moduleErrors,
+  };
 }
 
 async function main() {
   await ensureDirectories();
+  const allLogs = [];
+  const log = makeLogger("main", allLogs);
 
-  const browser = await chromium.launch({
-    headless: CONFIG.headless,
-  });
+  const browser = await chromium.launch({ headless: CONFIG.headless });
   const context = await browser.newContext({
     acceptDownloads: true,
     viewport: { width: 1600, height: 1000 },
@@ -1125,61 +1176,64 @@ async function main() {
   const page = await context.newPage();
   page.setDefaultTimeout(CONFIG.timeoutMs);
 
-  console.log(`[${nowIso()}] [INFO] Iniciando extracción contra ${CONFIG.baseUrl}`);
-
+  const moduleResults = [];
   try {
-    const landing = `${CONFIG.baseUrl}/home/formulario/AR/importDetalladas`;
-    await page.goto(landing, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
-    await maybeLogin(page, createLogger("auth", globalEvents));
-    await waitForPageSettled(page);
+    const initialUrl = `${CONFIG.baseUrl}${MODULES[0].urlPath}`;
+    log("Inicio de ejecución", "info", { baseUrl: CONFIG.baseUrl, initialUrl });
+    await page.goto(initialUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
+    await maybeLogin(page, makeLogger("auth", allLogs));
+    await waitForSettled(page);
+
+    for (const moduleDef of MODULES) {
+      const res = await processModule(page, context, moduleDef, allLogs);
+      moduleResults.push(res);
+    }
   } catch (error) {
-    const authLogger = createLogger("auth", globalEvents);
-    authLogger("Fallo durante autenticación inicial", "error", {
-      error: summarizeError(error),
-    });
-    await saveDebugArtifacts(page, "login_failure", authLogger);
+    log("Fallo fatal durante ejecución", "error", { error: summarizeError(error) });
+    await page.screenshot({
+      path: path.join(DATA_DIR, `fatal_${safeSlug(nowIso())}.png`),
+      fullPage: true,
+    }).catch(() => {});
+  } finally {
     await browser.close();
-    process.exit(1);
   }
 
-  for (const moduleDef of MODULES) {
-    const moduleResult = await processModule(page, context, moduleDef);
-    const fields = [...new Set(moduleResult.rows.flatMap((r) => Object.keys(r)))];
-    const metadata = {
-      extraction_datetime: nowIso(),
-      base_url: CONFIG.baseUrl,
-      module: moduleDef.key,
-      module_name: moduleDef.prettyName,
-      total_records: moduleResult.rows.length,
-      pages_traversed: moduleResult.pagesTraversed,
-      filters_used: moduleResult.filtersUsed,
-      filters_found: {
-        totalSelects: moduleResult.filtersFound.allSelectsCount || 0,
-        totalDateInputs: moduleResult.filtersFound.dateInputs?.length || 0,
-      },
-      extraction_mode: moduleResult.extractionMode,
-      native_downloads: moduleResult.nativeDownloads,
-      errors_detected: moduleResult.errors,
-      available_fields: fields,
-    };
+  const allNormalized = moduleResults.flatMap((m) => m.normalizedRows || []);
+  const deduped = dedupeNormalized(allNormalized);
 
-    const { jsonPath, xlsxPath } = await writeExcelAndJson(
-      moduleDef.key,
-      moduleResult.rows,
-      metadata,
-      moduleResult.logs
-    );
+  const metadata = {
+    extractedAt: nowIso(),
+    baseUrl: CONFIG.baseUrl,
+    totalModules: MODULES.length,
+    totalRawRows: moduleResults.reduce((acc, m) => acc + (m.rawRows?.length || 0), 0),
+    totalNormalizedRows: allNormalized.length,
+    totalDedupedRows: deduped.length,
+    mechanismsByModule: moduleResults.map((m) => ({
+      module: m.module,
+      mechanisms: m.usedMechanisms,
+    })),
+    moduleErrors: moduleResults.map((m) => ({ module: m.module, errors: m.errors })),
+    diagnostics: moduleResults.map((m) => ({
+      module: m.module,
+      screenshot: m.diagnostics?.screenshotPath || "",
+      html: m.diagnostics?.htmlPath || "",
+      domStats: m.diagnostics?.domStats || {},
+      relevantRequests: m.relevantRequests || [],
+    })),
+  };
 
+  const outputPaths = await writeMasterOutputs(deduped, metadata, allLogs);
+
+  log("Proceso finalizado", "info", {
+    totalDedupedRows: deduped.length,
+    outputs: outputPaths,
+  });
+
+  if (deduped.length === 0) {
     console.log(
-      `[${nowIso()}] [INFO] excel generado correctamente | ${moduleDef.key} | ${xlsxPath}`
-    );
-    console.log(
-      `[${nowIso()}] [INFO] json generado correctamente  | ${moduleDef.key} | ${jsonPath}`
+      `[${nowIso()}] [WARN] El resultado final quedó en 0 filas. Revisar archivos debug y logs en /data`
     );
   }
-
-  await browser.close();
-  console.log(`[${nowIso()}] [INFO] Proceso finalizado`);
 }
 
 main().catch((error) => {

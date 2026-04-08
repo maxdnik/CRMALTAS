@@ -31,6 +31,8 @@ const CONFIG = {
 
 const ROOT_DIR = path.resolve(__dirname, "..");
 const DATA_DIR = path.join(ROOT_DIR, "data");
+const NETWORK_DEBUG_PATH = path.join(DATA_DIR, "network-debug.json");
+
 const MODULES = [
   {
     key: "importadores",
@@ -46,18 +48,12 @@ const MODULES = [
   },
 ];
 
+const SEARCH_TEXT_REGEX = /(buscar|consultar|aplicar|filtrar|ver resultados|search|submit)/i;
+const EMPTY_TEXT_REGEX = /(sin resultados|no records|no data|sin datos)/i;
+const KEYWORD_REGEX = /(import|export|detalle|data|formulario|search|grid)/i;
+
 function nowIso() {
   return new Date().toISOString();
-}
-
-function safeSlug(value) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 120) || "na";
 }
 
 function isTruthy(v) {
@@ -72,6 +68,16 @@ function summarizeError(error) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function safeSlug(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120) || "na";
 }
 
 function makeLogger(scope, sink) {
@@ -101,45 +107,20 @@ async function waitForSettled(page) {
 }
 
 async function retry(action, options = {}) {
-  const { retries = 3, delayMs = 1200, actionName = "action", onRetry = () => {} } = options;
-  let lastErr;
+  const { retries = 3, delayMs = 1000, actionName = "action", onRetry = () => {} } = options;
+  let lastError;
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
       return await action(attempt);
     } catch (error) {
-      lastErr = error;
+      lastError = error;
       if (attempt < retries) {
         await onRetry(attempt, error);
         await sleep(delayMs * attempt);
       }
     }
   }
-  throw new Error(`${actionName} failed: ${summarizeError(lastErr)}`);
-}
-
-async function findVisibleClickable(page, regex) {
-  const loc = page.locator(
-    'button, [role="button"], a, input[type="button"], input[type="submit"], .btn'
-  );
-  const count = await loc.count().catch(() => 0);
-  for (let i = 0; i < count; i += 1) {
-    const item = loc.nth(i);
-    const visible = await item.isVisible().catch(() => false);
-    if (!visible) continue;
-    const enabled = await item.isEnabled().catch(() => true);
-    if (!enabled) continue;
-    const text = await item
-      .evaluate((el) => {
-        const v = el.value || "";
-        const t = el.innerText || el.textContent || "";
-        const a = el.getAttribute("aria-label") || "";
-        const ttl = el.getAttribute("title") || "";
-        return `${v} ${t} ${a} ${ttl}`.replace(/\s+/g, " ").trim();
-      })
-      .catch(() => "");
-    if (regex.test(text)) return item;
-  }
-  return null;
+  throw new Error(`${actionName} failed: ${summarizeError(lastError)}`);
 }
 
 async function maybeLogin(page, log) {
@@ -147,8 +128,7 @@ async function maybeLogin(page, log) {
     .evaluate(() => {
       const url = window.location.href.toLowerCase();
       const passInput = Boolean(document.querySelector('input[type="password"]'));
-      const loginWord = /login|signin|ingresar|sesion|session/.test(url);
-      return passInput || loginWord;
+      return passInput || /login|signin|ingresar|sesion|session/.test(url);
     })
     .catch(() => false);
 
@@ -158,7 +138,6 @@ async function maybeLogin(page, log) {
   }
 
   log("Login detectado, completando credenciales");
-
   const userLocator = page.locator(
     [
       'input[name*="user" i]',
@@ -169,7 +148,6 @@ async function maybeLogin(page, log) {
       "input[type='text']",
     ].join(",")
   );
-
   const passLocator = page.locator(
     [
       'input[name*="pass" i]',
@@ -190,85 +168,126 @@ async function maybeLogin(page, log) {
   await userLocator.first().fill(CONFIG.user, { timeout: 15000 });
   await passLocator.first().fill(CONFIG.pass, { timeout: 15000 });
 
-  const submit = await findVisibleClickable(
-    page,
-    /(ingresar|iniciar|acceder|login|entrar|submit)/i
+  const submitLoc = page.locator(
+    'button, [role="button"], a, input[type="button"], input[type="submit"], .btn'
   );
-  if (submit) {
-    await Promise.all([
-      page.waitForLoadState("networkidle", { timeout: 35000 }).catch(() => {}),
-      submit.click({ timeout: 12000 }),
-    ]);
-  } else {
+  const count = await submitLoc.count().catch(() => 0);
+  let clicked = false;
+  for (let i = 0; i < count; i += 1) {
+    const item = submitLoc.nth(i);
+    if (!(await item.isVisible().catch(() => false))) continue;
+    const text = await item
+      .evaluate((el) =>
+        `${el.innerText || ""} ${el.textContent || ""} ${el.value || ""}`.replace(/\s+/g, " ").trim()
+      )
+      .catch(() => "");
+    if (/(ingresar|iniciar|acceder|login|entrar|submit)/i.test(text)) {
+      await Promise.all([
+        page.waitForLoadState("networkidle", { timeout: 35000 }).catch(() => {}),
+        item.click({ timeout: 12000 }),
+      ]);
+      clicked = true;
+      break;
+    }
+  }
+  if (!clicked) {
     await passLocator.first().press("Enter");
     await page.waitForLoadState("networkidle", { timeout: 35000 }).catch(() => {});
   }
 
   const stillLogin = await page
     .evaluate(() => {
-      const url = window.location.href.toLowerCase();
       const passInput = Boolean(document.querySelector('input[type="password"]'));
+      const url = window.location.href.toLowerCase();
       return passInput && /login|signin|ingresar|sesion|session/.test(url);
     })
     .catch(() => true);
-
-  if (stillLogin) {
-    throw new Error("Login no completado: la vista de autenticación sigue visible");
-  }
+  if (stillLogin) throw new Error("Login no completado: pantalla de autenticación visible");
   log("login ok");
 }
 
-function createNetworkCollector(page, log) {
+function createNetworkCollector(page, log, bucket) {
   const collected = [];
-  const keywordRegex = /(import|export|detalle|search|data|grid|formulario)/i;
+
+  const onRequest = (request) => {
+    try {
+      const resourceType = request.resourceType();
+      if (!/(xhr|fetch)/i.test(resourceType)) return;
+      const url = request.url();
+      const body = request.postData() || "";
+      const relevant = KEYWORD_REGEX.test(url) || KEYWORD_REGEX.test(body);
+      if (!relevant) return;
+      collected.push({
+        ts: nowIso(),
+        type: "request",
+        method: request.method(),
+        url,
+        resourceType,
+        requestBodyPreview: body.slice(0, 1500),
+      });
+    } catch (error) {
+      log("Error capturando request", "warn", { error: summarizeError(error) });
+    }
+  };
 
   const onResponse = async (response) => {
     try {
       const req = response.request();
-      const url = response.url();
-      const method = req.method();
       const resourceType = req.resourceType();
+      if (!/(xhr|fetch)/i.test(resourceType)) return;
+      const url = response.url();
       const contentType = response.headers()["content-type"] || "";
-
-      if (!keywordRegex.test(url) && !/(xhr|fetch)/i.test(resourceType)) return;
-
+      const relevantUrl = KEYWORD_REGEX.test(url);
+      const isJsonLike = /json|javascript|problem\+json/i.test(contentType);
       const item = {
         ts: nowIso(),
+        type: "response",
+        method: req.method(),
         url,
-        method,
         status: response.status(),
         resourceType,
         contentType,
-        payloadType: "none",
-        sampleSize: 0,
-        parsedRecords: [],
+        relevantUrl,
+        hasJson: false,
+        jsonPreview: "",
+        parsedRecords: 0,
       };
 
-      const isJson = /application\/json|text\/json|javascript|problem\+json/i.test(contentType);
-      if (isJson) {
-        const body = await response.text().catch(() => "");
-        if (body && body.length > 0) {
-          item.sampleSize = body.length;
+      if (isJsonLike || relevantUrl) {
+        const text = await response.text().catch(() => "");
+        if (text) {
           try {
-            const parsed = JSON.parse(body);
-            item.payloadType = "json";
-            item.parsedRecords = extractRecordsFromJsonPayload(parsed, url);
+            const parsed = JSON.parse(text);
+            const jsonString = JSON.stringify(parsed);
+            const relevantBody = KEYWORD_REGEX.test(jsonString);
+            if (relevantUrl || relevantBody) {
+              item.hasJson = true;
+              item.jsonPreview = jsonString.slice(0, 4000);
+              item.parsedRecords = extractRecordsFromJsonPayload(parsed, url).length;
+            }
           } catch {
-            item.payloadType = "text";
+            // ignore non-json
           }
         }
       }
-
-      collected.push(item);
+      if (item.relevantUrl || item.hasJson) {
+        collected.push(item);
+      }
     } catch (error) {
-      log("Error capturando response de red", "warn", { error: summarizeError(error) });
+      log("Error capturando response", "warn", { error: summarizeError(error) });
     }
   };
 
+  page.on("request", onRequest);
   page.on("response", onResponse);
+
   return {
     getAll: () => collected,
-    stop: () => page.off("response", onResponse),
+    stop: () => {
+      page.off("request", onRequest);
+      page.off("response", onResponse);
+      bucket.push(...collected);
+    },
   };
 }
 
@@ -278,298 +297,330 @@ function flattenObject(input, prefix = "", out = {}) {
     if (prefix) out[prefix] = input;
     return out;
   }
-
   if (Array.isArray(input)) {
-    if (input.length === 0 && prefix) out[prefix] = "";
     input.forEach((val, idx) => {
       const key = prefix ? `${prefix}[${idx}]` : `[${idx}]`;
       flattenObject(val, key, out);
     });
     return out;
   }
-
   for (const [k, v] of Object.entries(input)) {
-    const nextKey = prefix ? `${prefix}.${k}` : k;
-    if (v && typeof v === "object") {
-      flattenObject(v, nextKey, out);
-    } else {
-      out[nextKey] = v;
-    }
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === "object") flattenObject(v, key, out);
+    else out[key] = v;
   }
   return out;
 }
 
 function extractRecordsFromJsonPayload(payload, sourceUrl) {
-  const records = [];
+  const out = [];
   const seen = new Set();
 
   const scoreObject = (obj) => {
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return 0;
-    const keys = Object.keys(obj).map((k) => k.toLowerCase());
-    const hasName = keys.some((k) => /(name|empresa|company|razon|consignee|shipper|importador|exportador)/.test(k));
-    const hasCountry = keys.some((k) => /(country|pais|origen|destino)/.test(k));
-    const hasAddress = keys.some((k) => /(address|direccion|ciudad|provincia|city|state)/.test(k));
-    const hasTax = keys.some((k) => /(cuit|tax|vat|id)/.test(k));
+    const keys = Object.keys(obj || {}).map((k) => k.toLowerCase());
     let score = 0;
-    if (hasName) score += 3;
-    if (hasCountry) score += 2;
-    if (hasAddress) score += 1;
-    if (hasTax) score += 1;
+    if (keys.some((k) => /(name|nombre|empresa|consignee|shipper|importador|exportador|razon)/.test(k))) score += 3;
+    if (keys.some((k) => /(country|pais|origen|destino)/.test(k))) score += 2;
+    if (keys.some((k) => /(address|direccion|city|provincia|state)/.test(k))) score += 1;
+    if (keys.some((k) => /(cuit|tax|vat|id)/.test(k))) score += 1;
     return score;
   };
 
   const visit = (node) => {
     if (!node) return;
     if (Array.isArray(node)) {
-      if (node.length > 0 && typeof node[0] === "object") {
-        for (const item of node) visit(item);
-      }
+      for (const item of node) visit(item);
       return;
     }
     if (typeof node !== "object") return;
-
-    const score = scoreObject(node);
-    if (score >= 2) {
+    if (scoreObject(node) >= 2) {
       const flat = flattenObject(node);
-      const hash = crypto
-        .createHash("sha1")
-        .update(JSON.stringify(flat).slice(0, 5000))
-        .digest("hex");
+      const hash = crypto.createHash("sha1").update(JSON.stringify(flat).slice(0, 5000)).digest("hex");
       if (!seen.has(hash)) {
         seen.add(hash);
-        records.push({
-          _source: "api_json",
-          _sourceUrl: sourceUrl,
-          ...flat,
-        });
+        out.push({ _source: "api_json", _sourceUrl: sourceUrl, ...flat });
       }
     }
-
     for (const value of Object.values(node)) {
       if (typeof value === "object") visit(value);
     }
   };
 
   visit(payload);
-  return records;
+  return out;
 }
 
-async function captureModuleDiagnostics(page, moduleDef, log) {
-  const screenshotPath = path.join(DATA_DIR, `${moduleDef.debugBaseName}.png`);
-  const htmlPath = path.join(DATA_DIR, `${moduleDef.debugBaseName}.html`);
-
-  await page.screenshot({ path: screenshotPath, fullPage: true }).catch((error) => {
-    log("No se pudo guardar screenshot de diagnóstico", "warn", {
-      error: summarizeError(error),
-    });
-  });
-  const html = await page.content().catch(() => "");
-  if (html) {
-    await fs.writeFile(htmlPath, html, "utf8");
-  }
-
-  const domStats = await page
-    .evaluate(() => {
+async function getFrameDiagnostics(frame) {
+  return frame
+    .evaluate((emptyRegexSource) => {
+      const emptyRegex = new RegExp(emptyRegexSource, "i");
       const q = (sel) => document.querySelectorAll(sel).length;
-      const visibleButtons = Array.from(
-        document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"], .btn')
-      )
-        .filter((el) => {
-          const style = window.getComputedStyle(el);
-          const rect = el.getBoundingClientRect();
-          return (
-            style.visibility !== "hidden" &&
-            style.display !== "none" &&
-            rect.width > 0 &&
-            rect.height > 0
-          );
-        })
-        .map((el) => ((el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim()))
-        .filter((t) => t.length > 0)
-        .slice(0, 200);
-
-      return {
-        table: q("table"),
-        tr: q("tr"),
-        input: q("input"),
-        select: q("select"),
-        button: q("button"),
-        roleRow: q('[role="row"]'),
-        agRow: q(".ag-row"),
-        pDatatableRows: q(".p-datatable-tbody tr"),
-        visibleButtons,
-      };
-    })
-    .catch(() => ({
-      table: 0,
-      tr: 0,
-      input: 0,
-      select: 0,
-      button: 0,
-      roleRow: 0,
-      agRow: 0,
-      pDatatableRows: 0,
-      visibleButtons: [],
-    }));
-
-  log("Diagnóstico DOM", "info", domStats);
-  return { screenshotPath, htmlPath, domStats };
-}
-
-async function clickSearchActions(page, log) {
-  const searchRegex = /(buscar|consultar|filtrar|aplicar|search|actualizar|mostrar)/i;
-  const clicked = [];
-
-  for (let i = 0; i < 4; i += 1) {
-    const btn = await findVisibleClickable(page, searchRegex);
-    if (!btn) break;
-    const label = await btn
-      .evaluate((el) => (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim())
-      .catch(() => "boton");
-    try {
-      await Promise.all([
-        page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {}),
-        btn.click({ timeout: 8000 }),
-      ]);
-      clicked.push(label);
-      await waitForSettled(page);
-      await sleep(600);
-    } catch {
-      break;
-    }
-  }
-
-  if (clicked.length > 0) {
-    log("Se ejecutaron acciones de búsqueda", "info", { clicked });
-  } else {
-    log("No se detectaron botones de búsqueda/aplicación");
-  }
-}
-
-async function maximizeRowsPerPage(page, log) {
-  const selects = page.locator("select");
-  const count = await selects.count().catch(() => 0);
-  let changed = 0;
-
-  for (let i = 0; i < count; i += 1) {
-    const s = selects.nth(i);
-    const visible = await s.isVisible().catch(() => false);
-    if (!visible) continue;
-
-    const meta = await s
-      .evaluate((el) => {
-        const label =
-          (el.getAttribute("aria-label") ||
-            el.getAttribute("name") ||
-            el.getAttribute("id") ||
-            "") +
-          " " +
-          (el.closest("label")?.textContent || "");
-        const options = Array.from(el.options || []).map((o) => ({
-          value: o.value,
-          text: (o.textContent || "").trim(),
-        }));
-        return { label: label.trim(), options };
-      })
-      .catch(() => ({ label: "", options: [] }));
-
-    const looksLikePageSize = /(fila|rows|page size|por pagina|por p[aá]gina|cantidad|mostrar|registros|items)/i.test(
-      meta.label
-    );
-    if (!looksLikePageSize) continue;
-
-    const numericOptions = meta.options
-      .map((opt) => ({
-        ...opt,
-        n: Number(String(opt.value || opt.text).replace(/[^\d]/g, "")),
-      }))
-      .filter((x) => Number.isFinite(x.n) && x.n > 0)
-      .sort((a, b) => a.n - b.n);
-
-    if (numericOptions.length === 0) continue;
-    const maxOption = numericOptions[numericOptions.length - 1];
-
-    try {
-      await s.selectOption({ value: String(maxOption.value) }, { timeout: 8000 });
-      changed += 1;
-    } catch {
-      await s.selectOption({ label: String(maxOption.text) }, { timeout: 8000 }).catch(() => {});
-      changed += 1;
-    }
-  }
-
-  if (changed > 0) {
-    log("Selector de filas por página maximizado", "info", { changed });
-    await waitForSettled(page);
-  }
-}
-
-async function detectFilterCombos(page, log) {
-  const filters = await page
-    .evaluate(() => {
-      const normalize = (v) => (v || "").replace(/\s+/g, " ").trim();
       const visible = (el) => {
         const st = window.getComputedStyle(el);
         const r = el.getBoundingClientRect();
         return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
       };
-      const arr = [];
+      const buttonLikeSelector =
+        'button, [role="button"], a, input[type="button"], input[type="submit"], .btn, div, span';
+
+      const buttons = Array.from(document.querySelectorAll(buttonLikeSelector))
+        .filter(visible)
+        .map((el) => (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim())
+        .filter((t) => t.length > 0)
+        .slice(0, 300);
+
+      const visibleText = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 4000);
+      const hasEmptyMessage = emptyRegex.test(visibleText);
+
+      return {
+        url: window.location.href,
+        table: q("table"),
+        tr: q("tr"),
+        roleRow: q('[role="row"]'),
+        agRow: q(".ag-row"),
+        pDatatableRows: q(".p-datatable-tbody tr"),
+        input: q("input"),
+        select: q("select"),
+        button: q("button"),
+        visibleButtons: buttons,
+        visibleText,
+        hasEmptyMessage,
+      };
+    }, EMPTY_TEXT_REGEX.source)
+    .catch(() => ({
+      url: frame.url(),
+      table: 0,
+      tr: 0,
+      roleRow: 0,
+      agRow: 0,
+      pDatatableRows: 0,
+      input: 0,
+      select: 0,
+      button: 0,
+      visibleButtons: [],
+      visibleText: "",
+      hasEmptyMessage: false,
+      frameError: true,
+    }));
+}
+
+async function captureDeepDiagnostics(page, moduleDef, log) {
+  const screenshotPath = path.join(DATA_DIR, `${moduleDef.debugBaseName}.png`);
+  const htmlPath = path.join(DATA_DIR, `${moduleDef.debugBaseName}.html`);
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+  const html = await page.content().catch(() => "");
+  if (html) await fs.writeFile(htmlPath, html, "utf8");
+
+  const frameInfos = [];
+  const frames = page.frames();
+  log("Iframes detectados", "info", { count: Math.max(frames.length - 1, 0) });
+
+  for (let idx = 0; idx < frames.length; idx += 1) {
+    const frame = frames[idx];
+    const isMain = frame === page.mainFrame();
+    const stats = await getFrameDiagnostics(frame);
+    frameInfos.push({
+      frameIndex: idx,
+      frameType: isMain ? "main_page" : "iframe",
+      name: frame.name() || "",
+      url: frame.url(),
+      ...stats,
+    });
+    log(`Diagnóstico ${isMain ? "main page" : "iframe"}`, "info", {
+      frameIndex: idx,
+      frameType: isMain ? "main_page" : "iframe",
+      frameUrl: frame.url(),
+      table: stats.table,
+      tr: stats.tr,
+      roleRow: stats.roleRow,
+      agRow: stats.agRow,
+      pDatatableRows: stats.pDatatableRows,
+      hasEmptyMessage: stats.hasEmptyMessage,
+      visibleButtons: stats.visibleButtons.slice(0, 50),
+      visibleTextPreview: (stats.visibleText || "").slice(0, 500),
+    });
+  }
+
+  const candidate = frameInfos
+    .slice()
+    .sort((a, b) => {
+      const scoreA = a.tr + a.roleRow + a.agRow + a.pDatatableRows;
+      const scoreB = b.tr + b.roleRow + b.agRow + b.pDatatableRows;
+      return scoreB - scoreA;
+    })[0];
+  const selectedFrame = candidate
+    ? frames[candidate.frameIndex]
+    : page.mainFrame();
+
+  log("Frame seleccionado para extracción", "info", {
+    frameIndex: candidate?.frameIndex ?? 0,
+    frameType: candidate?.frameType ?? "main_page",
+    frameUrl: candidate?.url || page.url(),
+    score:
+      (candidate?.tr || 0) +
+      (candidate?.roleRow || 0) +
+      (candidate?.agRow || 0) +
+      (candidate?.pDatatableRows || 0),
+  });
+
+  return {
+    screenshotPath,
+    htmlPath,
+    frameInfos,
+    selectedFrameIndex: candidate?.frameIndex ?? 0,
+  };
+}
+
+async function clickSearchLikeElementsInFrame(frame, log, labelScope) {
+  const clicked = await frame
+    .evaluate((regexSource) => {
+      const regex = new RegExp(regexSource, "i");
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
+      const candidates = Array.from(
+        document.querySelectorAll(
+          'button, [role="button"], a, input[type="button"], input[type="submit"], .btn, div, span'
+        )
+      )
+        .filter(visible)
+        .slice(0, 2000);
+
+      const results = [];
+      for (const el of candidates) {
+        const txt = (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim();
+        if (!txt || !regex.test(txt)) continue;
+        try {
+          el.click();
+          results.push(txt);
+        } catch {
+          // ignore
+        }
+      }
+      return results.slice(0, 50);
+    }, SEARCH_TEXT_REGEX.source)
+    .catch(() => []);
+
+  if (clicked.length > 0) {
+    log("Clicks de búsqueda ejecutados", "info", { scope: labelScope, clicked });
+  } else {
+    log("No se detectaron elementos clickeables de búsqueda", "info", { scope: labelScope });
+  }
+}
+
+async function clickSearchActions(page, frameInfos, log) {
+  await clickSearchLikeElementsInFrame(page.mainFrame(), log, "main_page");
+  const frames = page.frames();
+  for (const fi of frameInfos.filter((f) => f.frameType === "iframe")) {
+    const frame = frames[fi.frameIndex];
+    if (!frame) continue;
+    await clickSearchLikeElementsInFrame(frame, log, `iframe_${fi.frameIndex}`);
+  }
+  await waitForSettled(page);
+  await sleep(600);
+}
+
+async function maximizeRowsPerPage(frame, log, scope) {
+  const changed = await frame
+    .evaluate(() => {
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
       const selects = Array.from(document.querySelectorAll("select")).filter(visible);
-      selects.forEach((el, idx) => {
-        const label = normalize(
+      let changedCount = 0;
+      for (const select of selects) {
+        const label = (
+          (select.getAttribute("aria-label") || "") +
+          " " +
+          (select.getAttribute("name") || "") +
+          " " +
+          (select.getAttribute("id") || "") +
+          " " +
+          (select.closest("label")?.textContent || "")
+        )
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!/(rows|fila|por pagina|por p[aá]gina|cantidad|mostrar|registros|items|page size)/i.test(label)) {
+          continue;
+        }
+        const options = Array.from(select.options || [])
+          .map((opt) => ({
+            value: opt.value,
+            text: (opt.textContent || "").trim(),
+            num: Number(String(opt.value || opt.textContent || "").replace(/[^\d]/g, "")),
+          }))
+          .filter((o) => Number.isFinite(o.num) && o.num > 0)
+          .sort((a, b) => a.num - b.num);
+        if (!options.length) continue;
+        const max = options[options.length - 1];
+        select.value = max.value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        select.dispatchEvent(new Event("input", { bubbles: true }));
+        changedCount += 1;
+      }
+      return changedCount;
+    })
+    .catch(() => 0);
+  log("Selector de filas por página", "info", { scope, changed });
+}
+
+async function detectFilterCombos(frame, log, scope) {
+  const filters = await frame
+    .evaluate(() => {
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
+      const normalize = (v) => (v || "").replace(/\s+/g, " ").trim();
+      const selects = Array.from(document.querySelectorAll("select")).filter(visible);
+      return selects.map((el, idx) => ({
+        index: idx,
+        label: normalize(
           el.getAttribute("aria-label") ||
             el.getAttribute("name") ||
             el.getAttribute("id") ||
             el.closest("label")?.textContent ||
             ""
-        );
-        const options = Array.from(el.options || []).map((o) => ({
+        ),
+        options: Array.from(el.options || []).map((o) => ({
           value: o.value,
           text: normalize(o.textContent),
-        }));
-        arr.push({ index: idx, label, options });
-      });
-      return arr;
+        })),
+      }));
     })
     .catch(() => []);
 
   const eligible = filters
-    .map((f) => {
-      const options = (f.options || []).filter((o) => {
+    .map((f) => ({
+      ...f,
+      options: (f.options || []).filter((o) => {
         const txt = (o.text || "").toLowerCase();
-        return (
-          (isTruthy(o.value) || isTruthy(o.text)) &&
-          !/todos|all|seleccione|select|--|sin filtro/.test(txt)
-        );
-      });
-      return { ...f, options };
-    })
-    .filter((f) => {
-      if ((f.options || []).length <= 1) return false;
-      return /(pais|country|period|fecha|anio|año|mes|origen|destino)/i.test(f.label);
-    })
+        return isTruthy(o.value) || (isTruthy(o.text) && !/todos|all|seleccione|select|--/.test(txt));
+      }),
+    }))
+    .filter((f) => (f.options || []).length > 1)
+    .filter((f) => /(pais|country|period|fecha|anio|año|mes|origen|destino)/i.test(f.label))
     .slice(0, 3);
 
   if (eligible.length === 0) {
-    log("No se detectaron filtros de país/período útiles");
+    log("No se detectaron filtros útiles", "info", { scope });
     return [{ selects: [] }];
   }
 
   let combos = [{ selects: [] }];
   for (const f of eligible) {
     const next = [];
-    const limitedOptions = f.options.slice(0, 100);
     for (const combo of combos) {
-      for (const opt of limitedOptions) {
+      for (const opt of f.options.slice(0, 100)) {
         next.push({
           selects: [
             ...combo.selects,
-            {
-              index: f.index,
-              label: f.label,
-              value: opt.value || opt.text,
-              text: opt.text || opt.value,
-            },
+            { index: f.index, label: f.label, value: opt.value || opt.text, text: opt.text || opt.value },
           ],
         });
         if (next.length >= CONFIG.maxFilterCombos) break;
@@ -579,60 +630,86 @@ async function detectFilterCombos(page, log) {
     combos = next.length ? next : combos;
     if (combos.length >= CONFIG.maxFilterCombos) break;
   }
-
-  log("Filtros detectados", "info", {
-    filters: eligible.map((x) => ({ label: x.label, options: x.options.length })),
-    totalCombos: combos.length,
-  });
+  log("Combinaciones de filtros detectadas", "info", { scope, totalCombos: combos.length });
   return combos.length ? combos : [{ selects: [] }];
 }
 
-async function applyFilterCombo(page, combo, log) {
-  for (const sel of combo.selects || []) {
-    const locator = page.locator("select").nth(sel.index);
-    const visible = await locator.isVisible().catch(() => false);
-    if (!visible) continue;
-    try {
-      await locator.selectOption({ value: String(sel.value) }, { timeout: 8000 });
-    } catch {
-      await locator.selectOption({ label: String(sel.text) }, { timeout: 8000 }).catch(() => {});
-    }
-  }
-  await clickSearchActions(page, log);
-  await waitForSettled(page);
+async function applyFilterCombo(frame, combo) {
+  await frame
+    .evaluate((comboArg) => {
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
+      const selects = Array.from(document.querySelectorAll("select")).filter(visible);
+      for (const sel of comboArg.selects || []) {
+        const target = selects[sel.index];
+        if (!target) continue;
+        const byValue = Array.from(target.options).find((o) => String(o.value) === String(sel.value));
+        const byText = Array.from(target.options).find(
+          (o) => String(o.textContent || "").trim() === String(sel.text).trim()
+        );
+        const finalOption = byValue || byText;
+        if (!finalOption) continue;
+        target.value = finalOption.value;
+        target.dispatchEvent(new Event("change", { bubbles: true }));
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    }, combo)
+    .catch(() => {});
 }
 
-function extractRelevantRequests(networkEvents) {
-  const keywordRegex = /(import|export|detalle|search|data|grid|formulario)/i;
-  return networkEvents
-    .filter((e) => keywordRegex.test(e.url))
-    .map((e) => ({
-      ts: e.ts,
-      method: e.method,
-      status: e.status,
-      url: e.url,
-      contentType: e.contentType,
-      parsedRecords: (e.parsedRecords || []).length,
-    }));
+async function detectNativeExportInFrame(frame) {
+  return frame
+    .evaluate(() => {
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
+      const candidates = Array.from(
+        document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"], .btn')
+      ).filter(visible);
+      for (const el of candidates) {
+        const txt = (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim();
+        if (/(export|excel|csv|descargar|download|reporte)/i.test(txt)) {
+          return true;
+        }
+      }
+      return false;
+    })
+    .catch(() => false);
 }
 
-async function detectNativeExport(page) {
-  return findVisibleClickable(page, /(export|excel|csv|descargar|download|reporte)/i);
-}
+async function runNativeExport(page, frame, moduleDef, comboTag, log) {
+  const found = await detectNativeExportInFrame(frame);
+  if (!found) return null;
+  const clicked = await frame
+    .evaluate(() => {
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
+      const candidates = Array.from(
+        document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"], .btn')
+      ).filter(visible);
+      for (const el of candidates) {
+        const txt = (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim();
+        if (/(export|excel|csv|descargar|download|reporte)/i.test(txt)) {
+          el.click();
+          return txt;
+        }
+      }
+      return "";
+    })
+    .catch(() => "");
+  if (!clicked) return null;
 
-async function runNativeExport(page, moduleDef, comboTag, log) {
-  const button = await detectNativeExport(page);
-  if (!button) return null;
-  const filePrefix = `${moduleDef.key}_native_${safeSlug(comboTag || "base")}`;
-
-  const download = await Promise.all([
-    page.waitForEvent("download", { timeout: 25000 }),
-    button.click({ timeout: 8000 }),
-  ])
-    .then(([dl]) => dl)
-    .catch(() => null);
-
+  const download = await page.waitForEvent("download", { timeout: 25000 }).catch(() => null);
   if (!download) return null;
+  const filePrefix = `${moduleDef.key}_native_${safeSlug(comboTag || "base")}`;
   const ext = path.extname(download.suggestedFilename() || "") || ".dat";
   const outPath = path.join(DATA_DIR, `${filePrefix}${ext}`);
   await download.saveAs(outPath);
@@ -646,172 +723,132 @@ async function parseNativeFileToRows(filePath, moduleDef, log) {
     log("Archivo nativo no parseable (se conserva)", "warn", { filePath });
     return [];
   }
-
   const workbook = new ExcelJS.Workbook();
-  if (ext === ".xlsx") {
-    await workbook.xlsx.readFile(filePath);
-  } else {
-    await workbook.csv.readFile(filePath);
-  }
+  if (ext === ".xlsx") await workbook.xlsx.readFile(filePath);
+  else await workbook.csv.readFile(filePath);
   const ws = workbook.worksheets[0];
   if (!ws) return [];
-
   const headers = ws
     .getRow(1)
     .values.slice(1)
     .map((h, i) => (isTruthy(h) ? String(h).trim() : `col_${i + 1}`));
-
   const rows = [];
-  ws.eachRow((row, rowNum) => {
-    if (rowNum === 1) return;
+  ws.eachRow((row, idx) => {
+    if (idx === 1) return;
     const vals = row.values.slice(1);
     if (!vals.some((v) => isTruthy(v) || typeof v === "number")) return;
-    const obj = {};
-    for (let i = 0; i < headers.length; i += 1) {
-      obj[headers[i]] = vals[i] ?? "";
-    }
-    obj._source = "native_export";
-    obj._module = moduleDef.key;
-    rows.push(obj);
+    const out = {};
+    for (let i = 0; i < headers.length; i += 1) out[headers[i]] = vals[i] ?? "";
+    out._source = "native_export";
+    out._module = moduleDef.key;
+    rows.push(out);
   });
   return rows;
 }
 
-async function extractDomRows(page, moduleDef, comboLabel, pageNo) {
-  return page.evaluate(
-    ({ moduleKey, companyType, comboLabelArg, pageNoArg }) => {
-      const norm = (t) => (t || "").replace(/\s+/g, " ").trim();
-      const visible = (el) => {
-        const s = window.getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return s.visibility !== "hidden" && s.display !== "none" && r.width > 0 && r.height > 0;
-      };
-
-      const rows = [];
-
-      const pushRow = (raw, sourceKind) => {
-        const output = {
-          _source: sourceKind,
-          _module: moduleKey,
-          _companyType: companyType,
-          _filter: comboLabelArg,
-          _page: pageNoArg,
+async function extractDomRowsFromFrame(frame, moduleDef, comboLabel, pageNo, frameScope) {
+  return frame
+    .evaluate(
+      ({ moduleKey, companyType, comboLabelArg, pageNoArg, frameScopeArg }) => {
+        const norm = (v) => (v || "").replace(/\s+/g, " ").trim();
+        const visible = (el) => {
+          const st = window.getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
         };
-        for (const [k, v] of Object.entries(raw)) {
-          const key = norm(k) || "col";
-          output[key] = norm(v);
-        }
-        rows.push(output);
-      };
+        const rows = [];
+        const push = (raw, source) => {
+          const out = {
+            _source: source,
+            _module: moduleKey,
+            _companyType: companyType,
+            _filter: comboLabelArg,
+            _page: pageNoArg,
+            _frameScope: frameScopeArg,
+          };
+          for (const [k, v] of Object.entries(raw)) out[norm(k) || "col"] = norm(v);
+          rows.push(out);
+        };
 
-      // HTML tables
-      const tables = Array.from(document.querySelectorAll("table")).filter(visible);
-      tables.forEach((table, tIdx) => {
-        const headers = Array.from(table.querySelectorAll("thead th")).map(
-          (th, i) => norm(th.textContent) || `col_${i + 1}`
-        );
-        const trs = Array.from(table.querySelectorAll("tbody tr")).filter(visible);
-        trs.forEach((tr) => {
-          const tds = Array.from(tr.querySelectorAll("td"));
-          if (!tds.length) return;
-          const raw = { _table: tIdx + 1 };
-          tds.forEach((td, idx) => {
-            raw[headers[idx] || `col_${idx + 1}`] = norm(td.innerText || td.textContent);
-          });
-          const detailAnchor = tr.querySelector("a[href]");
-          if (detailAnchor) raw._detailHref = detailAnchor.getAttribute("href") || "";
-          pushRow(raw, "dom_table");
-        });
-      });
-
-      // role=row grids
-      const roleRows = Array.from(document.querySelectorAll('[role="row"]')).filter(visible);
-      if (roleRows.length > 1) {
-        const headerCells = Array.from(
-          roleRows[0].querySelectorAll('[role="columnheader"], .ag-header-cell-text')
-        );
-        const headers = headerCells.map((h, i) => norm(h.textContent) || `col_${i + 1}`);
-        for (let i = 1; i < roleRows.length; i += 1) {
-          const rr = roleRows[i];
-          const cells = Array.from(
-            rr.querySelectorAll('[role="gridcell"], [role="cell"], .ag-cell, .p-datatable-tbody td')
+        const tables = Array.from(document.querySelectorAll("table")).filter(visible);
+        tables.forEach((table, tIdx) => {
+          const headers = Array.from(table.querySelectorAll("thead th")).map(
+            (th, i) => norm(th.textContent) || `col_${i + 1}`
           );
-          if (!cells.length) continue;
-          const raw = {};
-          cells.forEach((cell, idx) => {
-            raw[headers[idx] || `col_${idx + 1}`] = norm(cell.innerText || cell.textContent);
+          const trs = Array.from(table.querySelectorAll("tbody tr")).filter(visible);
+          trs.forEach((tr) => {
+            const tds = Array.from(tr.querySelectorAll("td"));
+            if (!tds.length) return;
+            const raw = { _table: tIdx + 1 };
+            tds.forEach((td, idx) => {
+              raw[headers[idx] || `col_${idx + 1}`] = norm(td.innerText || td.textContent);
+            });
+            const a = tr.querySelector("a[href]");
+            if (a) raw._detailHref = a.getAttribute("href") || "";
+            push(raw, "dom_table");
           });
-          const detailAnchor = rr.querySelector("a[href]");
-          if (detailAnchor) raw._detailHref = detailAnchor.getAttribute("href") || "";
-          pushRow(raw, "dom_role_grid");
-        }
-      }
+        });
 
-      // ag-grid fallback by row/cell classes
-      const agRows = Array.from(document.querySelectorAll(".ag-row")).filter(visible);
-      if (agRows.length) {
-        agRows.forEach((r) => {
-          const cells = Array.from(r.querySelectorAll(".ag-cell"));
+        const roleRows = Array.from(document.querySelectorAll('[role="row"]')).filter(visible);
+        if (roleRows.length > 1) {
+          const headers = Array.from(roleRows[0].querySelectorAll('[role="columnheader"], .ag-header-cell-text')).map(
+            (h, i) => norm(h.textContent) || `col_${i + 1}`
+          );
+          for (let i = 1; i < roleRows.length; i += 1) {
+            const rr = roleRows[i];
+            const cells = Array.from(
+              rr.querySelectorAll('[role="gridcell"], [role="cell"], .ag-cell, .p-datatable-tbody td')
+            );
+            if (!cells.length) continue;
+            const raw = {};
+            cells.forEach((cell, idx) => {
+              raw[headers[idx] || `col_${idx + 1}`] = norm(cell.innerText || cell.textContent);
+            });
+            const a = rr.querySelector("a[href]");
+            if (a) raw._detailHref = a.getAttribute("href") || "";
+            push(raw, "dom_role_grid");
+          }
+        }
+
+        const agRows = Array.from(document.querySelectorAll(".ag-row")).filter(visible);
+        agRows.forEach((row) => {
+          const cells = Array.from(row.querySelectorAll(".ag-cell"));
           if (!cells.length) return;
           const raw = {};
-          cells.forEach((c, idx) => {
-            raw[`ag_col_${idx + 1}`] = norm(c.innerText || c.textContent);
-          });
-          pushRow(raw, "dom_ag_grid");
+          cells.forEach((c, idx) => (raw[`ag_col_${idx + 1}`] = norm(c.innerText || c.textContent)));
+          push(raw, "dom_ag_grid");
         });
-      }
 
-      // PrimeNG fallback
-      const pRows = Array.from(document.querySelectorAll(".p-datatable-tbody tr")).filter(visible);
-      if (pRows.length) {
+        const pRows = Array.from(document.querySelectorAll(".p-datatable-tbody tr")).filter(visible);
         pRows.forEach((tr) => {
           const tds = Array.from(tr.querySelectorAll("td"));
           if (!tds.length) return;
           const raw = {};
-          tds.forEach((td, idx) => {
-            raw[`p_col_${idx + 1}`] = norm(td.innerText || td.textContent);
-          });
-          pushRow(raw, "dom_primeng");
+          tds.forEach((td, idx) => (raw[`p_col_${idx + 1}`] = norm(td.innerText || td.textContent)));
+          push(raw, "dom_primeng");
         });
-      }
 
-      // Generic div row-like fallback
-      const divRows = Array.from(
-        document.querySelectorAll(
-          '.row, .grid-row, .table-row, [class*="row"], [data-row-index], [data-testid*="row"]'
-        )
-      )
-        .filter(visible)
-        .slice(0, 2000);
-      if (divRows.length && rows.length === 0) {
-        divRows.forEach((r) => {
-          const txt = norm(r.innerText || r.textContent);
-          if (!txt || txt.length < 3) return;
-          pushRow({ rawText: txt }, "dom_div_grid");
-        });
+        return rows;
+      },
+      {
+        moduleKey: moduleDef.key,
+        companyType: moduleDef.companyType,
+        comboLabelArg: comboLabel,
+        pageNoArg: pageNo,
+        frameScopeArg: frameScope,
       }
-
-      return rows;
-    },
-    {
-      moduleKey: moduleDef.key,
-      companyType: moduleDef.companyType,
-      comboLabelArg: comboLabel,
-      pageNoArg: pageNo,
-    }
-  );
+    )
+    .catch(() => []);
 }
 
-async function openDetailIfAnyAndExtract(page, context, row, log) {
+async function openDetailIfAnyAndExtract(context, row, log) {
   const href = row._detailHref || row._detail_href || row.detailHref;
   if (!isTruthy(href)) return row;
-
   let absolute = String(href);
   if (!absolute.startsWith("http")) {
     absolute = `${CONFIG.baseUrl}${absolute.startsWith("/") ? "" : "/"}${absolute}`;
   }
   if (!absolute.startsWith(CONFIG.baseUrl)) return row;
-
   const p = await context.newPage();
   p.setDefaultTimeout(CONFIG.timeoutMs);
   try {
@@ -822,16 +859,13 @@ async function openDetailIfAnyAndExtract(page, context, row, log) {
       const out = {};
       document.querySelectorAll("dt").forEach((dt) => {
         const dd = dt.nextElementSibling;
-        if (dd && dd.tagName.toLowerCase() === "dd") {
-          const k = norm(dt.textContent);
-          if (k) out[`detail_${k}`] = norm(dd.textContent);
-        }
+        if (dd && dd.tagName.toLowerCase() === "dd") out[`detail_${norm(dt.textContent)}`] = norm(dd.textContent);
       });
       document.querySelectorAll("label").forEach((lb) => {
-        const k = norm(lb.textContent);
-        if (!k || out[`detail_${k}`]) return;
+        const key = norm(lb.textContent);
+        if (!key || out[`detail_${key}`]) return;
         const sib = lb.nextElementSibling;
-        if (sib) out[`detail_${k}`] = norm(sib.textContent);
+        if (sib) out[`detail_${key}`] = norm(sib.textContent);
       });
       return out;
     });
@@ -839,74 +873,62 @@ async function openDetailIfAnyAndExtract(page, context, row, log) {
     return { ...row, ...detail, _detailUrl: absolute };
   } catch (error) {
     await p.close();
-    log("No se pudo extraer detalle de registro", "warn", {
-      href: absolute,
-      error: summarizeError(error),
-    });
+    log("No se pudo extraer detalle de registro", "warn", { href: absolute, error: summarizeError(error) });
     return row;
   }
 }
 
-async function advancePagination(page, log) {
-  const signatureBefore = await page
+async function advancePaginationInFrame(frame, log, scope) {
+  const moved = await frame
     .evaluate(() => {
-      const snap = Array.from(document.querySelectorAll("table tbody tr, .ag-row, .p-datatable-tbody tr"))
-        .slice(0, 5)
-        .map((n) => (n.innerText || "").replace(/\s+/g, " ").trim())
-        .join("||");
-      return `${window.location.href}::${snap}`;
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
+      const clickByRegex = (regex) => {
+        const list = Array.from(
+          document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"], .btn')
+        ).filter(visible);
+        for (const el of list) {
+          const txt = (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim();
+          if (regex.test(txt)) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      };
+      if (clickByRegex(/(cargar m[aá]s|mostrar m[aá]s|load more|ver m[aá]s)/i)) return "load_more";
+      if (clickByRegex(/(siguiente|next|pr[oó]xima|›|»)/i)) return "next";
+      return "";
     })
     .catch(() => "");
 
-  const loadMore = await findVisibleClickable(page, /(cargar m[aá]s|mostrar m[aá]s|load more|ver m[aá]s)/i);
-  if (loadMore) {
-    await loadMore.click({ timeout: 8000 }).catch(() => {});
-    await waitForSettled(page);
+  if (moved) {
+    log("Paginación detectada", "info", { scope, mode: moved });
     return true;
   }
 
-  const next = await findVisibleClickable(page, /(siguiente|next|pr[oó]xima|›|»)/i);
-  if (next) {
-    await next.click({ timeout: 8000 }).catch(() => {});
-    await waitForSettled(page);
-    const signatureAfter = await page
-      .evaluate(() => {
-        const snap = Array.from(document.querySelectorAll("table tbody tr, .ag-row, .p-datatable-tbody tr"))
-          .slice(0, 5)
-          .map((n) => (n.innerText || "").replace(/\s+/g, " ").trim())
-          .join("||");
-        return `${window.location.href}::${snap}`;
-      })
-      .catch(() => "");
-    if (signatureAfter !== signatureBefore) return true;
-  }
-
-  const beforeCount = await page
-    .locator("table tbody tr, .ag-row, .p-datatable-tbody tr, [role='row']")
-    .count()
+  const before = await frame
+    .evaluate(() => document.querySelectorAll("table tbody tr, .ag-row, .p-datatable-tbody tr, [role='row']").length)
     .catch(() => 0);
-  await page.mouse.wheel(0, 2200).catch(() => {});
-  await sleep(600);
-  await waitForSettled(page);
-  const afterCount = await page
-    .locator("table tbody tr, .ag-row, .p-datatable-tbody tr, [role='row']")
-    .count()
-    .catch(() => beforeCount);
-  if (afterCount > beforeCount) {
-    log("Infinite scroll detectado", "info", { beforeCount, afterCount });
+  await frame.page().mouse.wheel(0, 2200).catch(() => {});
+  await sleep(700);
+  const after = await frame
+    .evaluate(() => document.querySelectorAll("table tbody tr, .ag-row, .p-datatable-tbody tr, [role='row']").length)
+    .catch(() => before);
+  if (after > before) {
+    log("Infinite scroll detectado", "info", { scope, before, after });
     return true;
   }
-
   return false;
 }
 
 function getValueByKeyPatterns(raw, patterns) {
-  const entries = Object.entries(raw || {});
-  for (const [key, value] of entries) {
-    const lk = key.toLowerCase();
-    if (patterns.some((p) => p.test(lk)) && isTruthy(value)) {
-      return String(value).trim();
-    }
+  for (const [k, v] of Object.entries(raw || {})) {
+    const lk = k.toLowerCase();
+    if (patterns.some((p) => p.test(lk)) && isTruthy(v)) return String(v).trim();
   }
   return "";
 }
@@ -926,7 +948,6 @@ function normalizeRecord(raw, moduleDef, sourceUrl) {
   const email = getValueByKeyPatterns(raw, [/(email|correo|mail|e-mail)/]);
 
   if (!name && !taxId) return null;
-
   return {
     name: name || "",
     companyType: moduleDef.companyType,
@@ -951,9 +972,8 @@ function dedupeNormalized(records) {
     if (!r) continue;
     const base = `${(r.name || "").toLowerCase().trim()}|${(r.country || "").toLowerCase().trim()}`;
     const key = r.taxId ? `${base}|tax:${String(r.taxId).toLowerCase().trim()}` : base;
-    if (!out.has(key)) {
-      out.set(key, r);
-    } else {
+    if (!out.has(key)) out.set(key, r);
+    else {
       const prev = out.get(key);
       const merged = { ...prev };
       for (const [k, v] of Object.entries(r)) {
@@ -992,7 +1012,6 @@ async function writeMasterOutputs(records, metadata, logs) {
     "sourceUrl",
     "extractedAt",
   ];
-
   dataSheet.columns = columns.map((c) => ({ header: c, key: c, width: 24 }));
   records.forEach((r) => dataSheet.addRow(r));
   dataSheet.views = [{ state: "frozen", ySplit: 1 }];
@@ -1000,24 +1019,13 @@ async function writeMasterOutputs(records, metadata, logs) {
     from: { row: 1, column: 1 },
     to: { row: 1, column: columns.length },
   };
-  dataSheet.columns.forEach((col) => {
-    let max = String(col.header).length;
-    col.eachCell({ includeEmpty: true }, (cell) => {
-      const len = String(cell.value ?? "").length;
-      if (len > max) max = len;
-    });
-    col.width = Math.min(Math.max(max + 2, 14), 60);
-  });
 
   metadataSheet.columns = [
     { header: "campo", key: "campo", width: 40 },
     { header: "valor", key: "valor", width: 120 },
   ];
-  Object.entries(metadata).forEach(([campo, valor]) => {
-    metadataSheet.addRow({
-      campo,
-      valor: typeof valor === "string" ? valor : JSON.stringify(valor),
-    });
+  Object.entries(metadata).forEach(([k, v]) => {
+    metadataSheet.addRow({ campo: k, valor: typeof v === "string" ? v : JSON.stringify(v) });
   });
 
   logsSheet.columns = [
@@ -1028,40 +1036,45 @@ async function writeMasterOutputs(records, metadata, logs) {
     { header: "extra", key: "extra", width: 120 },
   ];
   logs.forEach((l) => logsSheet.addRow(l));
-
   await workbook.xlsx.writeFile(xlsxPath);
 
-  const csvWorkbook = new ExcelJS.Workbook();
-  const csvSheet = csvWorkbook.addWorksheet("master");
-  csvSheet.columns = columns.map((c) => ({ header: c, key: c }));
-  records.forEach((r) => csvSheet.addRow(r));
-  await csvWorkbook.csv.writeFile(csvPath);
+  const csvWb = new ExcelJS.Workbook();
+  const csvWs = csvWb.addWorksheet("master");
+  csvWs.columns = columns.map((c) => ({ header: c, key: c }));
+  records.forEach((r) => csvWs.addRow(r));
+  await csvWb.csv.writeFile(csvPath);
 
   return { jsonPath, xlsxPath, csvPath };
 }
 
-async function processModule(page, context, moduleDef, globalLogs) {
-  const log = makeLogger(moduleDef.key, globalLogs);
+async function processModule(page, context, moduleDef, allLogs, networkBucket) {
+  const log = makeLogger(moduleDef.key, allLogs);
   const moduleUrl = `${CONFIG.baseUrl}${moduleDef.urlPath}`;
-  const moduleRawRows = [];
-  const moduleNormalized = [];
+  const rawRows = [];
+  const normalizedRows = [];
   const usedMechanisms = new Set();
-  const moduleErrors = [];
+  const errors = [];
 
   log("Navegando módulo", "info", { moduleUrl });
   await page.goto(moduleUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
   await maybeLogin(page, log);
   await waitForSettled(page);
 
-  const networkCollector = createNetworkCollector(page, log);
-  await clickSearchActions(page, log);
-  await maximizeRowsPerPage(page, log);
-  await clickSearchActions(page, log);
+  const networkCollector = createNetworkCollector(page, log, networkBucket);
+  await sleep(800);
+
+  const diagnostics = await captureDeepDiagnostics(page, moduleDef, log);
+  const frames = page.frames();
+  const selectedFrame = frames[diagnostics.selectedFrameIndex] || page.mainFrame();
+  const selectedScope =
+    diagnostics.frameInfos.find((f) => f.frameIndex === diagnostics.selectedFrameIndex)?.frameType || "main_page";
+
+  await clickSearchActions(page, diagnostics.frameInfos, log);
+  await maximizeRowsPerPage(selectedFrame, log, selectedScope);
+  await clickSearchActions(page, diagnostics.frameInfos, log);
   await waitForSettled(page);
 
-  const diagnostics = await captureModuleDiagnostics(page, moduleDef, log);
-
-  const filterCombos = await detectFilterCombos(page, log);
+  const filterCombos = await detectFilterCombos(selectedFrame, log, selectedScope);
   let nativeDownloadCount = 0;
 
   for (let comboIdx = 0; comboIdx < filterCombos.length; comboIdx += 1) {
@@ -1070,102 +1083,139 @@ async function processModule(page, context, moduleDef, globalLogs) {
       (combo.selects || [])
         .map((s) => `${s.label || "filter"}=${s.text || s.value}`)
         .join(" | ") || "sin_filtro";
+    log("Aplicando filtro", "info", { comboIdx: comboIdx + 1, comboLabel, scope: selectedScope });
+    await applyFilterCombo(selectedFrame, combo);
+    await clickSearchActions(page, diagnostics.frameInfos, log);
+    await waitForSettled(page);
 
-    log("Aplicando filtro", "info", { comboIdx: comboIdx + 1, comboLabel });
-    await applyFilterCombo(page, combo, log);
-
-    // Intento exportación nativa por combinación.
     const nativePath = await retry(
-      async () => runNativeExport(page, moduleDef, `${comboIdx + 1}_${comboLabel}`, log),
+      () => runNativeExport(page, selectedFrame, moduleDef, `${comboIdx + 1}_${comboLabel}`, log),
       {
         retries: 2,
         delayMs: 1200,
         actionName: "runNativeExport",
         onRetry: (attempt, err) =>
-          log("Reintento exportación nativa", "warn", {
-            attempt,
-            error: summarizeError(err),
-          }),
+          log("Reintento exportación nativa", "warn", { attempt, error: summarizeError(err) }),
       }
     ).catch(() => null);
 
     if (nativePath) {
       usedMechanisms.add("native_export");
       nativeDownloadCount += 1;
-      const parsedRows = await parseNativeFileToRows(nativePath, moduleDef, log).catch((error) => {
-        moduleErrors.push(`parse_native: ${summarizeError(error)}`);
+      const parsed = await parseNativeFileToRows(nativePath, moduleDef, log).catch((error) => {
+        errors.push(`parse_native: ${summarizeError(error)}`);
         return [];
       });
-      moduleRawRows.push(...parsedRows);
+      rawRows.push(...parsed);
     }
 
-    // Si no hubo datos de export nativa, o vino vacía, recorrer DOM + paginación.
-    if (!nativePath || moduleRawRows.length === 0) {
+    if (!nativePath || rawRows.length === 0) {
       let pageNo = 1;
-      let pagesVisited = 0;
-      while (pagesVisited < CONFIG.maxPagesPerModule) {
-        pagesVisited += 1;
-        log("Extrayendo grilla DOM", "info", { comboLabel, pageNo });
-        const rows = await extractDomRows(page, moduleDef, comboLabel, pageNo).catch((error) => {
-          moduleErrors.push(`extract_dom: ${summarizeError(error)}`);
-          return [];
-        });
-
-        for (const row of rows) {
-          const withDetail = await openDetailIfAnyAndExtract(page, context, row, log);
-          moduleRawRows.push(withDetail);
+      let visited = 0;
+      while (visited < CONFIG.maxPagesPerModule) {
+        visited += 1;
+        const domRows = await extractDomRowsFromFrame(selectedFrame, moduleDef, comboLabel, pageNo, selectedScope);
+        if (!domRows.length) {
+          log("La tabla/grilla no existe o no devuelve filas en este contexto", "warn", {
+            scope: selectedScope,
+            comboLabel,
+            pageNo,
+          });
         }
-
-        const moved = await advancePagination(page, log);
+        for (const row of domRows) {
+          const withDetail = await openDetailIfAnyAndExtract(context, row, log);
+          rawRows.push(withDetail);
+        }
+        const moved = await advancePaginationInFrame(selectedFrame, log, selectedScope);
         if (!moved) break;
         pageNo += 1;
       }
-      if (moduleRawRows.length > 0) usedMechanisms.add("dom_grid");
+      if (rawRows.length) usedMechanisms.add("dom_grid");
     }
   }
 
-  // Si sigue vacío, última chance: usar eventos de red parseados.
   const networkEvents = networkCollector.getAll();
   networkCollector.stop();
-  const apiRows = networkEvents.flatMap((e) => e.parsedRecords || []);
+  const apiRows = networkEvents
+    .filter((e) => e.type === "response" && e.hasJson && e.jsonPreview)
+    .flatMap((e) => {
+      try {
+        const parsed = JSON.parse(e.jsonPreview);
+        return extractRecordsFromJsonPayload(parsed, e.url);
+      } catch {
+        return [];
+      }
+    });
+
   if (apiRows.length > 0) {
     usedMechanisms.add("api_json");
-    moduleRawRows.push(...apiRows.map((r) => ({ ...r, _module: moduleDef.key })));
+    rawRows.push(...apiRows.map((r) => ({ ...r, _module: moduleDef.key, _frameScope: selectedScope })));
+    log("Requests JSON con datos detectados", "info", { count: apiRows.length, scope: selectedScope });
+  } else {
+    log("No hubo requests JSON con datos útiles", "warn", { scope: selectedScope });
   }
 
-  // Normalización
-  for (const raw of moduleRawRows) {
-    const normalized = normalizeRecord(raw, moduleDef, moduleUrl);
-    if (normalized) moduleNormalized.push(normalized);
+  for (const raw of rawRows) {
+    const norm = normalizeRecord(raw, moduleDef, moduleUrl);
+    if (norm) normalizedRows.push(norm);
+  }
+
+  if (normalizedRows.length === 0) {
+    const emptyFlags = diagnostics.frameInfos
+      .map((f) => ({ frameIndex: f.frameIndex, frameType: f.frameType, hasEmptyMessage: f.hasEmptyMessage }))
+      .filter((x) => x.hasEmptyMessage);
+    if (emptyFlags.length > 0) {
+      log("La UI muestra estado vacío", "warn", { emptyFlags });
+    }
+    errors.push("Sin registros normalizados tras agotar export nativa + API + DOM + iframes");
   }
 
   log("Resumen módulo", "info", {
-    rawRows: moduleRawRows.length,
-    normalizedRows: moduleNormalized.length,
+    rawRows: rawRows.length,
+    normalizedRows: normalizedRows.length,
     nativeDownloadCount,
     mechanisms: [...usedMechanisms],
+    selectedScope,
   });
-
-  if (moduleNormalized.length === 0) {
-    moduleErrors.push("Sin registros normalizados tras agotar export nativa + API + DOM");
-    log("Módulo sin datos tras agotar estrategias", "warn");
-  }
 
   return {
     module: moduleDef.key,
     moduleUrl,
-    rawRows: moduleRawRows,
-    normalizedRows: moduleNormalized,
+    rawRows,
+    normalizedRows,
     diagnostics,
     usedMechanisms: [...usedMechanisms],
-    relevantRequests: extractRelevantRequests(networkEvents),
-    errors: moduleErrors,
+    errors,
   };
+}
+
+async function writeNetworkDebugFile(networkBucket, logs) {
+  const networkOut = {
+    generatedAt: nowIso(),
+    totalEvents: networkBucket.length,
+    events: networkBucket.map((e) => ({
+      ts: e.ts,
+      type: e.type,
+      method: e.method,
+      url: e.url,
+      status: e.status || null,
+      resourceType: e.resourceType || "",
+      contentType: e.contentType || "",
+      relevantUrl: Boolean(e.relevantUrl),
+      hasJson: Boolean(e.hasJson),
+      parsedRecords: e.parsedRecords || 0,
+      requestBodyPreview: (e.requestBodyPreview || "").slice(0, 1500),
+      jsonPreview: (e.jsonPreview || "").slice(0, 4000),
+    })),
+    logs,
+  };
+  await fs.writeFile(NETWORK_DEBUG_PATH, JSON.stringify(networkOut, null, 2), "utf8");
 }
 
 async function main() {
   await ensureDirectories();
   const allLogs = [];
+  const networkBucket = [];
   const log = makeLogger("main", allLogs);
 
   const browser = await chromium.launch({ headless: CONFIG.headless });
@@ -1185,18 +1235,20 @@ async function main() {
     await waitForSettled(page);
 
     for (const moduleDef of MODULES) {
-      const res = await processModule(page, context, moduleDef, allLogs);
-      moduleResults.push(res);
+      const result = await processModule(page, context, moduleDef, allLogs, networkBucket);
+      moduleResults.push(result);
     }
   } catch (error) {
     log("Fallo fatal durante ejecución", "error", { error: summarizeError(error) });
-    await page.screenshot({
-      path: path.join(DATA_DIR, `fatal_${safeSlug(nowIso())}.png`),
-      fullPage: true,
-    }).catch(() => {});
+    await page
+      .screenshot({ path: path.join(DATA_DIR, `fatal_${safeSlug(nowIso())}.png`), fullPage: true })
+      .catch(() => {});
   } finally {
     await browser.close();
   }
+
+  await writeNetworkDebugFile(networkBucket, allLogs);
+  log("network-debug.json generado", "info", { path: NETWORK_DEBUG_PATH, events: networkBucket.length });
 
   const allNormalized = moduleResults.flatMap((m) => m.normalizedRows || []);
   const deduped = dedupeNormalized(allNormalized);
@@ -1208,32 +1260,33 @@ async function main() {
     totalRawRows: moduleResults.reduce((acc, m) => acc + (m.rawRows?.length || 0), 0),
     totalNormalizedRows: allNormalized.length,
     totalDedupedRows: deduped.length,
-    mechanismsByModule: moduleResults.map((m) => ({
-      module: m.module,
-      mechanisms: m.usedMechanisms,
-    })),
+    mechanismsByModule: moduleResults.map((m) => ({ module: m.module, mechanisms: m.usedMechanisms })),
     moduleErrors: moduleResults.map((m) => ({ module: m.module, errors: m.errors })),
     diagnostics: moduleResults.map((m) => ({
       module: m.module,
       screenshot: m.diagnostics?.screenshotPath || "",
       html: m.diagnostics?.htmlPath || "",
-      domStats: m.diagnostics?.domStats || {},
-      relevantRequests: m.relevantRequests || [],
+      selectedFrameIndex: m.diagnostics?.selectedFrameIndex ?? 0,
+      frameInfos: m.diagnostics?.frameInfos || [],
     })),
+    networkDebugFile: NETWORK_DEBUG_PATH,
   };
 
-  const outputPaths = await writeMasterOutputs(deduped, metadata, allLogs);
-
-  log("Proceso finalizado", "info", {
-    totalDedupedRows: deduped.length,
-    outputs: outputPaths,
-  });
-
   if (deduped.length === 0) {
-    console.log(
-      `[${nowIso()}] [WARN] El resultado final quedó en 0 filas. Revisar archivos debug y logs en /data`
-    );
+    log("Sin filas en resultado final. Se prioriza diagnóstico profundo; no se genera master.", "warn", {
+      networkDebugFile: NETWORK_DEBUG_PATH,
+      diagnostics: moduleResults.map((m) => ({
+        module: m.module,
+        html: m.diagnostics?.htmlPath || "",
+        screenshot: m.diagnostics?.screenshotPath || "",
+      })),
+    });
+    await fs.writeFile(path.join(DATA_DIR, "diagnostic-summary.json"), JSON.stringify(metadata, null, 2), "utf8");
+    return;
   }
+
+  const outputs = await writeMasterOutputs(deduped, metadata, allLogs);
+  log("Proceso finalizado con datos", "info", { totalDedupedRows: deduped.length, outputs });
 }
 
 main().catch((error) => {

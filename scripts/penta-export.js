@@ -35,6 +35,7 @@ const NETWORK_DEBUG_PATH = path.join(DATA_DIR, "network-debug.json");
 const AUTH_STATE_PATH = path.join(DATA_DIR, "auth-state.json");
 const LOGIN_FAILED_SCREENSHOT = path.join(DATA_DIR, "login-failed.png");
 const LOGIN_FAILED_HTML = path.join(DATA_DIR, "login-failed.html");
+const LOGIN_SUCCESS_SCREENSHOT = path.join(DATA_DIR, "login-success.png");
 
 const MODULES = [
   {
@@ -192,6 +193,13 @@ async function saveLoginFailureArtifacts(page, log) {
   }
 }
 
+async function saveLoginSuccessScreenshot(page, log) {
+  await page
+    .screenshot({ path: LOGIN_SUCCESS_SCREENSHOT, fullPage: true })
+    .then(() => log("Screenshot de login exitoso guardado", "info", { path: LOGIN_SUCCESS_SCREENSHOT }))
+    .catch((error) => log("No se pudo guardar screenshot de login exitoso", "warn", { error: summarizeError(error) }));
+}
+
 async function getFirstVisibleLocator(page, selectors) {
   for (const selector of selectors) {
     const loc = page.locator(selector).first();
@@ -254,33 +262,129 @@ async function ensureLoggedIn(page, context, log) {
   await userCandidate.locator.fill(CONFIG.user, { timeout: 15000 });
   await passCandidate.locator.fill(CONFIG.pass, { timeout: 15000 });
 
-  const submit = await getFirstVisibleLocator(page, [
-    'button[type="submit"]',
-    'input[type="submit"]',
-    'button:has-text("Enter")',
-    'button:has-text("Ingresar")',
-    'button:has-text("Login")',
-    '[role="button"]:has-text("Enter")',
-    '[role="button"]:has-text("Ingresar")',
-    "button",
-    '[role="button"]',
-    "a",
-    ".btn",
-  ]);
+  const submitCandidates = await page
+    .evaluate(() => {
+      const visible = (el) => {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      };
+      const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
+      const form =
+        document.querySelector('input[type="password"]')?.closest("form") ||
+        document.querySelector('input[type="text"], input[type="email"]')?.closest("form") ||
+        document.querySelector("form");
+      if (!form) return [];
+
+      const all = Array.from(form.querySelectorAll("button, input, a, [role='button'], div, span")).filter(visible);
+      return all.map((el, idx) => ({
+        index: idx,
+        tagName: (el.tagName || "").toLowerCase(),
+        text: normalize(el.innerText || el.textContent || el.value || ""),
+        type: normalize(el.getAttribute("type") || ""),
+        href: normalize(el.getAttribute("href") || ""),
+        selectorHint: `${(el.tagName || "").toLowerCase()}${el.getAttribute("type") ? `[type="${el.getAttribute("type")}"]` : ""}`,
+      }));
+    })
+    .catch(() => []);
+
+  log("candidatos de submit detectados", "info", {
+    total: submitCandidates.length,
+    candidates: submitCandidates.slice(0, 40).map((c) => ({
+      tagName: c.tagName,
+      text: c.text,
+      type: c.type,
+      href: c.href,
+    })),
+  });
+
+  const isDisallowedCandidate = (candidate) => {
+    const text = String(candidate.text || "").toLowerCase();
+    const href = String(candidate.href || "").toLowerCase();
+    return (
+      candidate.tagName === "a" ||
+      text.includes("forgot") ||
+      text.includes("password") ||
+      href.includes("olvide")
+    );
+  };
+
+  const findCandidateByPriority = () => {
+    const allowed = submitCandidates.filter((c) => !isDisallowedCandidate(c));
+    const exactText = (value) => (txt) => String(txt || "").trim().toLowerCase() === value;
+    return (
+      allowed.find((c) => c.tagName === "button" && c.type === "submit") ||
+      allowed.find((c) => c.tagName === "input" && c.type === "submit") ||
+      allowed.find((c) => c.tagName === "button" && exactText("enter")(c.text)) ||
+      allowed.find((c) => c.tagName === "button" && exactText("ingresar")(c.text)) ||
+      null
+    );
+  };
+
+  const selectedSubmit = findCandidateByPriority();
+  log("submit elegido", "info", {
+    selector: selectedSubmit?.selectorHint || "form.requestSubmit()/form.submit()",
+    tagName: selectedSubmit?.tagName || "form",
+    text: selectedSubmit?.text || "",
+    type: selectedSubmit?.type || "",
+    href: selectedSubmit?.href || "",
+  });
 
   const previousUrl = page.url();
-  if (submit) {
-    const submitText = await submit.locator
-      .evaluate((el) => (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim())
-      .catch(() => "");
-    log("submit ejecutado", "info", { element: submit.selector, text: submitText });
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => null),
-      submit.locator.click({ timeout: 12000 }),
-    ]).catch(() => {});
+  if (selectedSubmit) {
+    const clicked = await page
+      .evaluate((target) => {
+        const visible = (el) => {
+          const st = window.getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+        };
+        const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
+        const form =
+          document.querySelector('input[type="password"]')?.closest("form") ||
+          document.querySelector('input[type="text"], input[type="email"]')?.closest("form") ||
+          document.querySelector("form");
+        if (!form) return false;
+        const all = Array.from(form.querySelectorAll("button, input, a, [role='button'], div, span")).filter(visible);
+        const node = all[target.index];
+        if (!node) return false;
+        const tagName = (node.tagName || "").toLowerCase();
+        const text = normalize(node.innerText || node.textContent || node.value || "").toLowerCase();
+        const href = normalize(node.getAttribute("href") || "").toLowerCase();
+        if (tagName === "a" || text.includes("forgot") || text.includes("password") || href.includes("olvide")) {
+          return false;
+        }
+        node.click();
+        return true;
+      }, selectedSubmit)
+      .catch(() => false);
+    if (!clicked) {
+      log("No se pudo clickear submit seleccionado, se usa submit del formulario", "warn");
+      await page
+        .locator("form")
+        .first()
+        .evaluate((form) => {
+          if (form.requestSubmit) form.requestSubmit();
+          else form.submit();
+        })
+        .catch(() => {});
+    } else {
+      log("submit ejecutado", "info", {
+        tagName: selectedSubmit.tagName,
+        text: selectedSubmit.text,
+        type: selectedSubmit.type,
+      });
+    }
   } else {
-    log("No se encontró botón submit explícito, usando Enter en password", "warn");
-    await passCandidate.locator.press("Enter");
+    log("No se encontró submit explícito válido, se hace submit del formulario", "warn");
+    await page
+      .locator("form")
+      .first()
+      .evaluate((form) => {
+        if (form.requestSubmit) form.requestSubmit();
+        else form.submit();
+      })
+      .catch(() => {});
   }
 
   await Promise.race([
@@ -291,6 +395,7 @@ async function ensureLoggedIn(page, context, log) {
   await waitForSettled(page);
 
   const postState = await isLoginLikeState(page);
+  const postUrlLower = String(postState.url || "").toLowerCase();
   log("url post-login", "info", {
     previousUrl,
     currentUrl: postState.url,
@@ -298,6 +403,12 @@ async function ensureLoggedIn(page, context, log) {
     hasLoginText: postState.hasLoginText,
     hasPasswordInput: postState.hasPasswordInput,
   });
+
+  if (postUrlLower.includes("/olvide-mi-password") || postUrlLower.includes("olvide")) {
+    log("se hizo click en recuperación de contraseña por error", "error", { currentUrl: postState.url });
+    await saveLoginFailureArtifacts(page, log);
+    throw new Error("Login fallido: se navegó a recuperación de contraseña");
+  }
 
   const loginFailed = postState.isLoginUrl || postState.hasLoginText || postState.hasPasswordInput;
   if (loginFailed) {
@@ -311,6 +422,7 @@ async function ensureLoggedIn(page, context, log) {
 
   await context.storageState({ path: AUTH_STATE_PATH });
   log("login exitoso", "info", { url: postState.url });
+  await saveLoginSuccessScreenshot(page, log);
   log("Estado autenticado guardado", "info", { path: AUTH_STATE_PATH });
 }
 

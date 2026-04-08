@@ -276,15 +276,26 @@ async function ensureLoggedIn(page, context, log) {
         document.querySelector("form");
       if (!form) return [];
 
-      const all = Array.from(form.querySelectorAll("button, input, a, [role='button'], div, span")).filter(visible);
-      return all.map((el, idx) => ({
+      const all = Array.from(
+        form.querySelectorAll(
+          "button, input, ion-button, a, [role='button'], div, span, .button, .botonLogin"
+        )
+      ).filter(visible);
+      return all.map((el, idx) => {
+        const parent = el.parentElement;
+        const parentTag = (parent?.tagName || "").toLowerCase();
+        const parentType = normalize(parent?.getAttribute?.("type") || "");
+        return {
         index: idx,
         tagName: (el.tagName || "").toLowerCase(),
         text: normalize(el.innerText || el.textContent || el.value || ""),
         type: normalize(el.getAttribute("type") || ""),
         href: normalize(el.getAttribute("href") || ""),
+        parentTag,
+        parentType,
         selectorHint: `${(el.tagName || "").toLowerCase()}${el.getAttribute("type") ? `[type="${el.getAttribute("type")}"]` : ""}`,
-      }));
+        };
+      });
     })
     .catch(() => []);
 
@@ -295,6 +306,8 @@ async function ensureLoggedIn(page, context, log) {
       text: c.text,
       type: c.type,
       href: c.href,
+      parentTag: c.parentTag,
+      parentType: c.parentType,
     })),
   });
 
@@ -317,6 +330,25 @@ async function ensureLoggedIn(page, context, log) {
       allowed.find((c) => c.tagName === "input" && c.type === "submit") ||
       allowed.find((c) => c.tagName === "button" && exactText("enter")(c.text)) ||
       allowed.find((c) => c.tagName === "button" && exactText("ingresar")(c.text)) ||
+      // Fallback UI libraries: ion-button hosts the actual click handler.
+      allowed.find((c) => c.tagName === "ion-button" && c.type === "submit") ||
+      allowed.find((c) => c.tagName === "ion-button" && exactText("enter")(c.text)) ||
+      allowed.find((c) => c.tagName === "ion-button" && exactText("ingresar")(c.text)) ||
+      // Fallback específico: span Enter dentro de ion-button/button submit.
+      allowed.find(
+        (c) =>
+          c.tagName === "span" &&
+          exactText("enter")(c.text) &&
+          ((c.parentTag === "ion-button" && c.parentType === "submit") ||
+            (c.parentTag === "button" && c.parentType === "submit"))
+      ) ||
+      allowed.find(
+        (c) =>
+          c.tagName === "span" &&
+          exactText("ingresar")(c.text) &&
+          ((c.parentTag === "ion-button" && c.parentType === "submit") ||
+            (c.parentTag === "button" && c.parentType === "submit"))
+      ) ||
       null
     );
   };
@@ -345,7 +377,11 @@ async function ensureLoggedIn(page, context, log) {
           document.querySelector('input[type="text"], input[type="email"]')?.closest("form") ||
           document.querySelector("form");
         if (!form) return false;
-        const all = Array.from(form.querySelectorAll("button, input, a, [role='button'], div, span")).filter(visible);
+        const all = Array.from(
+          form.querySelectorAll(
+            "button, input, ion-button, a, [role='button'], div, span, .button, .botonLogin"
+          )
+        ).filter(visible);
         const node = all[target.index];
         if (!node) return false;
         const tagName = (node.tagName || "").toLowerCase();

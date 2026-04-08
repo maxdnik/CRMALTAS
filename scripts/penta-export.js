@@ -5,7 +5,6 @@ const fs = require("node:fs/promises");
 const fssync = require("node:fs");
 const path = require("node:path");
 const dotenv = require("dotenv");
-
 const { chromium } = require("playwright");
 
 dotenv.config();
@@ -33,26 +32,15 @@ const LOGIN_FAILED_SCREENSHOT = path.join(DATA_DIR, "login-failed.png");
 const LOGIN_FAILED_HTML = path.join(DATA_DIR, "login-failed.html");
 const LOGIN_SUCCESS_SCREENSHOT = path.join(DATA_DIR, "login-success.png");
 
-const TARGET_MODULE_URL = `${CONFIG.baseUrl}/home/formulario/AR/importDetalladas`;
-
-const OUTPUTS = {
-  fullHtml: path.join(DATA_DIR, "importadores-module-full.html"),
-  fullPng: path.join(DATA_DIR, "importadores-module-full.png"),
-  openedHtml: path.join(DATA_DIR, "pais-origen-opened.html"),
-  openedPng: path.join(DATA_DIR, "pais-origen-opened.png"),
-  analysisJson: path.join(DATA_DIR, "importadores-ui-analysis.json"),
-};
+const STEP_DASHBOARD = path.join(DATA_DIR, "step-dashboard.png");
+const STEP_MENU_OPEN = path.join(DATA_DIR, "step-argentina-menu-open.png");
+const STEP_IMPORT_OPEN = path.join(DATA_DIR, "step-importaciones-detalladas-open.png");
 
 const LOGIN_TEXT_REGEX =
   /(user login|user password|forgot my password|enter|iniciar sesi[oó]n|ingresar|password)/i;
-const NO_RESULTS_REGEX = /no se encontraron resultados|no results|sin datos|no data|no records/i;
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeText(value) {
@@ -63,6 +51,10 @@ function summarizeError(error) {
   if (!error) return "unknown_error";
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function makeLogger(scope) {
@@ -81,10 +73,6 @@ async function ensureDirectories() {
 async function waitForSettled(page) {
   await page.waitForLoadState("domcontentloaded", { timeout: 25000 }).catch(() => {});
   await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
-}
-
-async function saveJson(filePath, data) {
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
 }
 
 async function createContextWithAuthState(browser, log) {
@@ -110,7 +98,7 @@ async function isLoginLikeState(page) {
     .evaluate((regexSource) => {
       const loginRegex = new RegExp(regexSource, "i");
       const url = window.location.href;
-      const txt = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000);
+      const txt = normalizeText(document.body?.innerText || "").slice(0, 3000);
       return {
         url,
         isLoginUrl: /\/login(?:\/|$|\?)/i.test(url.toLowerCase()),
@@ -199,6 +187,8 @@ async function ensureLoggedIn(page, context, log) {
     'ion-button[type="submit"]',
     'button:has-text("Enter")',
     'button:has-text("Ingresar")',
+    'ion-button:has-text("Enter")',
+    'ion-button:has-text("Ingresar")',
   ]);
 
   if (submit) {
@@ -236,543 +226,286 @@ async function ensureLoggedIn(page, context, log) {
   await context.storageState({ path: AUTH_STATE_PATH });
 }
 
-async function navigateAndEnsureSession(page, context, log, url) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
-  await waitForSettled(page);
-  const state = await isLoginLikeState(page);
-  if (state.isLoginUrl) {
-    log("Redirección a /login detectada. Reautenticando", "warn", { currentUrl: state.url });
-    await ensureLoggedIn(page, context, log);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
-    await waitForSettled(page);
-  }
-}
-
-async function captureInitialModuleArtifacts(page, log) {
-  await page.screenshot({ path: OUTPUTS.fullPng, fullPage: true }).catch(() => {});
-  const html = await page.content().catch(() => "");
-  if (html) await fs.writeFile(OUTPUTS.fullHtml, html, "utf8");
-  log("Archivos iniciales de módulo guardados", "info", {
-    html: OUTPUTS.fullHtml,
-    png: OUTPUTS.fullPng,
-  });
-}
-
-async function collectCountryOriginCandidates(page) {
-  return page.evaluate(() => {
-    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
+async function findAndOpenArgentinaMenu(page, log) {
+  const result = await page.evaluate(() => {
+    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim().toLowerCase();
     const visible = (el) => {
       const st = window.getComputedStyle(el);
       const r = el.getBoundingClientRect();
       return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
     };
-    const shortHtml = (el) => (el.outerHTML || "").replace(/\s+/g, " ").trim().slice(0, 300);
-    const bbox = (el) => {
+
+    const viewportTopBand = window.innerHeight * 0.35;
+    const candidates = [];
+
+    const pushCandidate = (el, reason) => {
+      if (!el || !visible(el)) return;
       const r = el.getBoundingClientRect();
-      return { x: r.x, y: r.y, width: r.width, height: r.height };
+      if (r.top > viewportTopBand) return;
+      const text = normalize(el.innerText || el.textContent || el.getAttribute("aria-label") || "");
+      const className = String(el.className || "").toLowerCase();
+      const id = String(el.id || "").toLowerCase();
+      const src = String(el.getAttribute("src") || "").toLowerCase();
+      const styleBg = String(el.style?.backgroundImage || "").toLowerCase();
+      candidates.push({
+        el,
+        reason,
+        top: r.top,
+        left: r.left,
+        width: r.width,
+        height: r.height,
+        text,
+        className,
+        id,
+        src,
+        styleBg,
+      });
     };
 
-    const roots = [];
-    const byLabelText = Array.from(document.querySelectorAll("*")).filter((el) =>
-      /pa[ií]s de origen/i.test(normalize(el.textContent || ""))
-    );
-    roots.push(...byLabelText);
-    roots.push(...Array.from(document.querySelectorAll('label, [aria-label*="País" i], [role="combobox"], [role="listbox"], [role="option"], ion-select, ion-item, ion-input, p-dropdown, ng-select, mat-select, .p-dropdown, .ng-select, .mat-mdc-select')));
-    roots.push(...Array.from(document.querySelectorAll('input[name*="pais" i], input[id*="pais" i], [placeholder*="País de Origen" i], [placeholder*="pais" i]')));
-
-    const uniq = [];
-    const seen = new Set();
-    for (const el of roots) {
-      if (!el || seen.has(el)) continue;
-      seen.add(el);
-
-      const near = el.closest("ion-item, .p-field, .form-group, .row, .col, div, section, mat-form-field, p-dropdown, ng-select") || el;
-      const keyEl = near || el;
-      if (seen.has(keyEl)) continue;
-      seen.add(keyEl);
-
-      const id = keyEl.id || "";
-      const name = keyEl.getAttribute("name") || "";
-      const placeholder = keyEl.getAttribute("placeholder") || "";
-      const role = keyEl.getAttribute("role") || "";
-      const ariaLabel = keyEl.getAttribute("aria-label") || "";
-      const ariaExpanded = keyEl.getAttribute("aria-expanded") || "";
-      const textContent = normalize(keyEl.textContent || "");
-      const innerText = normalize(keyEl.innerText || "");
-      const className = normalize(keyEl.className || "");
-      const tagName = (keyEl.tagName || "").toLowerCase();
-      const isVisible = visible(keyEl);
-      const box = bbox(keyEl);
-
-      uniq.push({
-        tagName,
-        textContent: textContent.slice(0, 250),
-        innerText: innerText.slice(0, 250),
-        className: className.slice(0, 250),
-        id,
-        name,
-        placeholder,
-        role,
-        ariaLabel,
-        ariaExpanded,
-        outerHTML: shortHtml(keyEl),
-        boundingBox: box,
-        visible: isVisible,
-      });
+    // 1) img con arg/argentina/flag.
+    for (const img of Array.from(document.querySelectorAll("img"))) {
+      const src = String(img.getAttribute("src") || "").toLowerCase();
+      const alt = String(img.getAttribute("alt") || "").toLowerCase();
+      const title = String(img.getAttribute("title") || "").toLowerCase();
+      if (/arg|argentina|bandera|flag/.test(`${src} ${alt} ${title}`)) {
+        const clickable = img.closest('button, a, [role="button"], li, div, ion-item, ion-button') || img;
+        pushCandidate(clickable, "img-argentina");
+      }
     }
 
-    return uniq
-      .filter((c) => {
-        const all = `${c.textContent} ${c.innerText} ${c.className} ${c.id} ${c.name} ${c.placeholder} ${c.role} ${c.ariaLabel}`.toLowerCase();
-        return /pa[ií]s|origen|country|combobox|dropdown|select|option|listbox|ion-|p-dropdown|ng-select|mat-select/.test(all);
-      })
-      .slice(0, 120);
-  });
-}
+    // 2) nodos topbar con texto argentina.
+    const textNodes = Array.from(document.querySelectorAll("button, a, [role='button'], li, div, span, ion-item, ion-button"));
+    for (const node of textNodes) {
+      const txt = normalize(node.innerText || node.textContent || "");
+      if (txt === "argentina" || txt.includes("argentina")) {
+        pushCandidate(node, "text-argentina");
+      }
+    }
 
-async function detectOpenedPanels(page) {
-  return page.evaluate(() => {
-    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
-    const visible = (el) => {
-      const st = window.getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
-    };
+    // 3) fallback: elementos del carrusel/top bar.
+    const topNodes = Array.from(
+      document.querySelectorAll(
+        "header * , ion-header * , .topbar * , .toolbar * , .navbar * , [class*='flag'] , [class*='bandera']"
+      )
+    );
+    for (const node of topNodes) {
+      const className = String(node.className || "").toLowerCase();
+      if (/flag|bandera|country|pais/.test(className)) {
+        const clickable = node.closest('button, a, [role="button"], li, div, ion-item, ion-button') || node;
+        pushCandidate(clickable, "topbar-flag-class");
+      }
+    }
 
-    const overlaySelectors = [
-      '[role="listbox"]',
-      '[role="option"]',
-      ".cdk-overlay-pane",
-      ".cdk-overlay-container",
-      ".p-dropdown-panel",
-      ".ng-dropdown-panel",
-      ".mat-mdc-select-panel",
-      "ion-alert",
-      "ion-popover",
-      "ion-modal",
-      ".dropdown-menu",
-      ".menu",
-      ".popover",
-      ".overlay",
-    ];
+    // Dedup por referencia.
+    const unique = [];
+    const seen = new Set();
+    for (const c of candidates) {
+      if (seen.has(c.el)) continue;
+      seen.add(c.el);
+      unique.push(c);
+    }
 
-    const overlays = Array.from(document.querySelectorAll(overlaySelectors.join(","))).filter(visible);
-    const options = Array.from(
-      document.querySelectorAll('[role="option"], .p-dropdown-item, .ng-option, mat-option, .mat-mdc-option, ion-select-option, li')
-    )
-      .filter(visible)
-      .map((el) => normalize(el.innerText || el.textContent || ""))
-      .filter((t) => t.length > 0);
+    // Score heurístico: arriba, izquierda, señales argentina.
+    unique.sort((a, b) => {
+      const score = (x) => {
+        let s = 0;
+        if (x.reason === "img-argentina") s += 200;
+        if (x.reason === "text-argentina") s += 120;
+        if (/arg|argentina/.test(`${x.text} ${x.src} ${x.className} ${x.id}`)) s += 80;
+        s += Math.max(0, 60 - x.top);
+        s += Math.max(0, 60 - x.left);
+        return s;
+      };
+      return score(b) - score(a);
+    });
+
+    const chosen = unique[0];
+    if (!chosen) return { clicked: false, strategy: "", reason: "no-candidate" };
+
+    // click normal o por bbox.
+    let clicked = false;
+    let strategy = "dom-click";
+    try {
+      chosen.el.click();
+      clicked = true;
+    } catch {
+      strategy = "bbox-click";
+      const r = chosen.el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const ev = document.elementFromPoint(cx, cy);
+      if (ev) {
+        ev.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: cx, clientY: cy }));
+        ev.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: cx, clientY: cy }));
+        ev.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: cx, clientY: cy }));
+        clicked = true;
+      }
+    }
 
     return {
-      overlayCount: overlays.length,
-      optionCount: options.length,
-      firstOptions: options.slice(0, 30),
-      hasListbox: document.querySelectorAll('[role="listbox"]').length > 0,
-      hasOptionRole: document.querySelectorAll('[role="option"]').length > 0,
-      optionDomSample:
-        overlays[0]?.outerHTML?.replace(/\s+/g, " ").trim().slice(0, 400) ||
-        (document.querySelector('[role="option"], .p-dropdown-item, .ng-option, mat-option, .mat-mdc-option, ion-select-option, li')?.outerHTML || "")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 400),
+      clicked,
+      strategy,
+      reason: chosen.reason,
+      chosenMeta: {
+        text: chosen.text,
+        className: chosen.className.slice(0, 200),
+        id: chosen.id,
+        src: chosen.src.slice(0, 200),
+        top: chosen.top,
+        left: chosen.left,
+        width: chosen.width,
+        height: chosen.height,
+      },
     };
   });
-}
 
-async function tryOpenCountryFilterWithStrategies(page, candidates, log) {
-  const attempts = [];
-
-  const runAttempt = async (strategyName, fn) => {
-    let success = false;
-    let error = "";
-    try {
-      await fn();
-      await sleep(450);
-      const panelState = await detectOpenedPanels(page);
-      success = panelState.overlayCount > 0 || panelState.optionCount > 0 || panelState.hasListbox;
-      attempts.push({
-        strategy: strategyName,
-        success,
-        panelState,
-      });
-      log(`Intento apertura País de Origen: ${strategyName}`, success ? "info" : "warn", {
-        overlayCount: panelState.overlayCount,
-        optionCount: panelState.optionCount,
-      });
-      return success;
-    } catch (e) {
-      error = summarizeError(e);
-      attempts.push({ strategy: strategyName, success: false, error });
-      log(`Intento apertura País de Origen falló: ${strategyName}`, "warn", { error });
-      return false;
-    }
-  };
-
-  const labelLike = page.getByText("País de Origen", { exact: true }).first();
-  const inputLike = page.locator('[placeholder*="País de Origen" i], [aria-label*="País de Origen" i], input[name*="pais" i], input[id*="pais" i]').first();
-  const arrowLike = page.locator('.p-dropdown-trigger, .ng-arrow-wrapper, .mat-mdc-select-arrow, ion-icon, [class*="arrow"], [class*="chevron"]').first();
-  const comboRole = page.locator('[role="combobox"]').first();
-
-  const firstVisibleCandidate = candidates.find((c) => c.visible && c.boundingBox?.width > 10 && c.boundingBox?.height > 10);
-
-  const strategies = [
-    {
-      name: "click-label",
-      fn: async () => {
-        if (await labelLike.isVisible().catch(() => false)) await labelLike.click({ timeout: 3000 });
-      },
-    },
-    {
-      name: "click-input",
-      fn: async () => {
-        if (await inputLike.isVisible().catch(() => false)) await inputLike.click({ timeout: 3000 });
-      },
-    },
-    {
-      name: "click-combobox-role",
-      fn: async () => {
-        if (await comboRole.isVisible().catch(() => false)) await comboRole.click({ timeout: 3000 });
-      },
-    },
-    {
-      name: "click-arrow-icon",
-      fn: async () => {
-        if (await arrowLike.isVisible().catch(() => false)) await arrowLike.click({ timeout: 3000 });
-      },
-    },
-    {
-      name: "focus-and-arrowdown",
-      fn: async () => {
-        if (await inputLike.isVisible().catch(() => false)) {
-          await inputLike.focus();
-          await page.keyboard.press("ArrowDown");
-        } else if (await comboRole.isVisible().catch(() => false)) {
-          await comboRole.focus();
-          await page.keyboard.press("ArrowDown");
-        }
-      },
-    },
-    {
-      name: "bbox-center-click",
-      fn: async () => {
-        if (!firstVisibleCandidate) return;
-        const { x, y, width, height } = firstVisibleCandidate.boundingBox;
-        const cx = x + width / 2;
-        const cy = y + height / 2;
-        await page.mouse.move(cx, cy);
-        await page.mouse.click(cx, cy);
-      },
-    },
-  ];
-
-  let winner = null;
-  for (const strategy of strategies) {
-    const ok = await runAttempt(strategy.name, strategy.fn);
-    if (ok) {
-      winner = strategy.name;
-      break;
-    }
+  if (!result.clicked) {
+    throw new Error("No se pudo clickear la bandera/contenedor de Argentina en topbar");
   }
 
-  if (winner) {
-    await page.screenshot({ path: OUTPUTS.openedPng, fullPage: true }).catch(() => {});
-    const openedHtml = await page.content().catch(() => "");
-    if (openedHtml) await fs.writeFile(OUTPUTS.openedHtml, openedHtml, "utf8");
-  }
+  log("bandera argentina encontrada", "info", {
+    strategy: result.strategy,
+    reason: result.reason,
+    chosen: result.chosenMeta,
+  });
 
-  const openedState = await detectOpenedPanels(page);
-  return { attempts, winner, openedState };
-}
-
-async function selectCountryByText(page, country, log) {
-  const result = await page
-    .evaluate((countryArg) => {
-      const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
-      const visible = (el) => {
-        const st = window.getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
-      };
-
-      const wanted = normalize(countryArg).toLowerCase();
-      const options = Array.from(
-        document.querySelectorAll('[role="option"], .p-dropdown-item, .ng-option, mat-option, .mat-mdc-option, ion-select-option, li')
-      ).filter(visible);
-
-      const exact = options.find((el) => normalize(el.innerText || el.textContent || "").toLowerCase() === wanted);
-      if (exact) {
-        exact.click();
-        return { selected: true, mode: "click-option", selectedText: normalize(exact.innerText || exact.textContent || "") };
-      }
-
-      const searchInput = Array.from(
-        document.querySelectorAll('input[type="search"], input[placeholder*="buscar" i], input[placeholder*="search" i], input[type="text"]')
-      ).find(visible);
-
-      if (searchInput) {
-        searchInput.value = countryArg;
-        searchInput.dispatchEvent(new Event("input", { bubbles: true }));
-        searchInput.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-
-      const optionsAfter = Array.from(
-        document.querySelectorAll('[role="option"], .p-dropdown-item, .ng-option, mat-option, .mat-mdc-option, ion-select-option, li')
-      ).filter(visible);
-      const exactAfter = optionsAfter.find((el) => normalize(el.innerText || el.textContent || "").toLowerCase() === wanted);
-      if (exactAfter) {
-        exactAfter.click();
-        return { selected: true, mode: "search+click-option", selectedText: normalize(exactAfter.innerText || exactAfter.textContent || "") };
-      }
-
-      return { selected: false, mode: "not-found", selectedText: "" };
-    }, country)
-    .catch(() => ({ selected: false, mode: "error", selectedText: "" }));
-
-  log(`Selección de país prueba (${country})`, result.selected ? "info" : "warn", result);
+  await sleep(500);
+  await waitForSettled(page);
   return result;
 }
 
-async function findAndClickBuscar(page, log) {
-  const clicked = await page
-    .evaluate(() => {
+async function waitArgentinaMenuOpened(page, log) {
+  const opened = await page
+    .waitForFunction(() => {
+      const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim().toLowerCase();
       const visible = (el) => {
         const st = window.getComputedStyle(el);
         const r = el.getBoundingClientRect();
         return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
       };
-      const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const buttons = Array.from(
-        document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"], ion-button')
-      ).filter(visible);
-      const target = buttons.find((el) => normalize(el.innerText || el.textContent || el.value || "") === "buscar");
-      if (!target) return false;
-      target.click();
-      return true;
-    })
+      const items = Array.from(document.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, span, div"))
+        .filter(visible)
+        .map((el) => normalize(el.innerText || el.textContent || ""))
+        .filter(Boolean);
+      const hasImportaciones = items.some((t) => t.includes("importaciones"));
+      const hasImportDet = items.some((t) => t.includes("importaciones detalladas"));
+      const hasExportaciones = items.some((t) => t.includes("exportaciones"));
+      return hasImportaciones && hasImportDet && hasExportaciones;
+    }, { timeout: 10000 })
+    .then(() => true)
     .catch(() => false);
+
+  if (!opened) {
+    throw new Error("No se abrió el menú desplegable de Argentina");
+  }
+
+  log("menú argentina abierto");
+}
+
+async function clickImportacionesDetalladas(page, log) {
+  const clicked = await page.evaluate(() => {
+    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const visible = (el) => {
+      const st = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+    };
+    const nodes = Array.from(
+      document.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, span, div, ion-item, ion-button")
+    ).filter(visible);
+    const target = nodes.find((el) => normalize(el.innerText || el.textContent || "") === "importaciones detalladas");
+    if (!target) return false;
+    target.click();
+    return true;
+  });
 
   if (!clicked) {
-    const fallback = page.getByText("Buscar", { exact: true }).first();
+    const fallback = page.getByText("Importaciones Detalladas", { exact: true }).first();
     if (await fallback.isVisible().catch(() => false)) {
-      await fallback.click({ timeout: 5000 }).catch(() => {});
-      return true;
+      await fallback.click({ timeout: 7000 }).catch(() => {});
+    } else {
+      throw new Error('No se pudo clickear "Importaciones Detalladas" en el menú de Argentina');
     }
-    log('No se encontró botón "Buscar"', "warn");
-    return false;
   }
-  return true;
-}
 
-async function analyzeSearchResultState(page, log) {
+  log("click en Importaciones Detalladas ejecutado");
   await waitForSettled(page);
-  await sleep(600);
-  const state = await page.evaluate((noResultsRegexSrc) => {
-    const noResultsRegex = new RegExp(noResultsRegexSrc, "i");
-    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
-    const visibleText = normalize(document.body?.innerText || "");
-    const noResultsByText = noResultsRegex.test(visibleText);
-    const table = document.querySelector("table");
-    const tableVisible = !!table;
-    const rows = table ? table.querySelectorAll("tbody tr").length : 0;
-
-    return {
-      noResultsByText,
-      tableVisible,
-      tableRowCount: rows,
-      visibleTextPreview: visibleText.slice(0, 500),
-    };
-  }, NO_RESULTS_REGEX.source);
-
-  log("Resultado tras Buscar", "info", state);
-  return state;
 }
 
-async function detectImportadorColumnAndPagination(page, log) {
-  return page.evaluate(() => {
-    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
-    const result = {
-      tableSelector: "",
-      importadorColumnIndex: -1,
-      importadorHeaderText: "",
-      paginationSelector: "",
-      paginationInfo: "",
-      backSelectorHint: "",
-    };
-
-    const table = document.querySelector("table");
-    if (!table) return result;
-    result.tableSelector = "table";
-
-    const headers = Array.from(table.querySelectorAll("thead th, tr th"));
-    for (let i = 0; i < headers.length; i += 1) {
-      const h = normalize(headers[i].innerText || headers[i].textContent || "");
-      if (h.toLowerCase() === "importador" || h.toLowerCase().includes("importador")) {
-        result.importadorColumnIndex = i;
-        result.importadorHeaderText = h;
-        break;
-      }
-    }
-
-    const pagCandidates = [
-      ".p-paginator",
-      ".mat-paginator",
-      ".pagination",
-      '[aria-label*="pagination" i]',
-      '[class*="paginator"]',
-    ];
-    const pagEl = pagCandidates.map((s) => document.querySelector(s)).find(Boolean);
-    if (pagEl) {
-      result.paginationSelector = pagCandidates.find((s) => document.querySelector(s)) || "";
-      result.paginationInfo = normalize(pagEl.innerText || pagEl.textContent || "").slice(0, 250);
-    }
-
-    const backCandidates = Array.from(
-      document.querySelectorAll('button, [role="button"], a, ion-button, .btn, .button')
-    ).find((el) => /volver/i.test(normalize(el.innerText || el.textContent || el.value || "")));
-    if (backCandidates) {
-      result.backSelectorHint = `${(backCandidates.tagName || "").toLowerCase()}${backCandidates.className ? "." + String(backCandidates.className).replace(/\s+/g, ".") : ""}`.slice(0, 180);
-    }
-    return result;
-  }).then((result) => {
-    log("Detección tabla/paginación/importador", "info", result);
-    return result;
-  });
-}
-
-async function returnToParametersIfPossible(page, log) {
-  const clicked = await page
-    .evaluate(() => {
-      const visible = (el) => {
-        const st = window.getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
-      };
-      const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const nodes = Array.from(
-        document.querySelectorAll('button, [role="button"], a, ion-button, .btn, .button')
-      ).filter(visible);
-      const back = nodes.find((el) => normalize(el.innerText || el.textContent || el.value || "").includes("volver"));
-      if (!back) return false;
-      back.click();
-      return true;
-    })
+async function waitImportacionesDetalladasLoaded(page, log) {
+  const ok = await page
+    .waitForFunction(() => {
+      const txt = (document.body?.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const hasTitle = txt.includes("argentina - importaciones detalladas");
+      const hasPanel = txt.includes("consulta por parámetros") || txt.includes("consulta por parametros");
+      return hasTitle && hasPanel;
+    }, { timeout: 15000 })
+    .then(() => true)
     .catch(() => false);
 
-  log("Volver a parámetros", clicked ? "info" : "warn", { clicked });
-  if (clicked) {
-    await waitForSettled(page);
-    await sleep(400);
+  if (!ok) {
+    throw new Error('No cargó la vista "Argentina - Importaciones Detalladas" con "Consulta por Parámetros"');
   }
+
+  log("vista Importaciones Detalladas cargada");
 }
 
-function buildStrategySummary(analysisState) {
-  const winner = analysisState.opening?.winner || "";
-  const firstAttemptWithOptions = (analysisState.opening?.attempts || []).find(
-    (a) => a.panelState && a.panelState.optionCount > 0
-  );
-  const sampleOptions = analysisState.opening?.openedState?.firstOptions || [];
-  const selectedAfghanistan = analysisState.tests?.afganistan?.selected || false;
-  const selectedGermany = analysisState.tests?.alemania?.selected || false;
-
-  return {
-    selectorOpenPaisOrigen: winner || "click en contenedor cercano a label País de Origen",
-    selectorChooseOption: "role=option / .p-dropdown-item / .ng-option (texto exacto)",
-    selectorBuscar: "button/ion-button con texto exacto 'Buscar'",
-    selectorNoResultados: "texto visible /No se encontraron resultados/i",
-    selectorTabla: analysisState.table?.tableSelector || "table",
-    selectorColumnaImportador:
-      analysisState.table?.importadorColumnIndex >= 0
-        ? `table thead th[index=${analysisState.table.importadorColumnIndex}] => Importador`
-        : "detectar header por texto 'Importador'",
-    selectorPaginacion: analysisState.table?.paginationSelector || "contenedor paginador (.p-paginator/.mat-paginator/.pagination)",
-    selectorVolverParametros: analysisState.table?.backSelectorHint || "botón/acción con texto 'Volver'",
-    strategyEndToEnd: [
-      "1) Abrir módulo importDetalladas autenticado",
-      "2) Abrir País de Origen usando estrategia ganadora",
-      "3) Seleccionar país por texto exacto en opción visible",
-      "4) Click Buscar",
-      "5) Si texto 'No se encontraron resultados' => país sin datos",
-      "6) Si hay tabla => detectar columna Importador y leer filas",
-      "7) Recorrer paginación con botón siguiente/índices hasta agotar",
-      "8) Volver a parámetros y repetir país siguiente",
-    ],
-    proof: {
-      openedWinner: winner,
-      optionsDetected: sampleOptions.slice(0, 30),
-      afganistanSelectionWorked: selectedAfghanistan,
-      alemaniaSelectionWorked: selectedGermany,
-    },
-  };
-}
-
-async function runAnalysis() {
+async function runNavigationOnly() {
   await ensureDirectories();
-  const log = makeLogger("analysis");
+  const log = makeLogger("nav");
+  const authLog = makeLogger("auth");
 
   const browser = await chromium.launch({ headless: CONFIG.headless });
   const context = await createContextWithAuthState(browser, log);
   const page = await context.newPage();
   page.setDefaultTimeout(CONFIG.timeoutMs);
 
-  const state = {
-    startedAt: nowIso(),
-    moduleUrl: TARGET_MODULE_URL,
-    candidates: [],
-    opening: null,
-    tests: {},
-    searchState: null,
-    table: null,
-    summary: null,
-    errors: [],
-  };
-
   try {
-    await ensureLoggedIn(page, context, makeLogger("auth"));
-    await navigateAndEnsureSession(page, context, log, TARGET_MODULE_URL);
-    await captureInitialModuleArtifacts(page, log);
+    await ensureLoggedIn(page, context, authLog);
 
-    const candidates = await collectCountryOriginCandidates(page);
-    state.candidates = candidates;
-    log("Candidatos relacionados a País de Origen detectados", "info", { count: candidates.length });
+    // Ir explícitamente a dashboard, no al módulo directo.
+    await page.goto(`${CONFIG.baseUrl}/home/dashboard`, {
+      waitUntil: "domcontentloaded",
+      timeout: CONFIG.timeoutMs,
+    });
+    await waitForSettled(page);
+    await page.screenshot({ path: STEP_DASHBOARD, fullPage: true }).catch(() => {});
 
-    const opening = await tryOpenCountryFilterWithStrategies(page, candidates, log);
-    state.opening = opening;
-
-    if (opening.winner) {
-      const af = await selectCountryByText(page, "Afganistán", log);
-      state.tests.afganistan = af;
-      await sleep(300);
-      const de = await selectCountryByText(page, "Alemania", log);
-      state.tests.alemania = de;
-      await sleep(300);
-    } else {
-      state.errors.push('No se pudo abrir "País de Origen" con estrategias automáticas');
+    const state = await isLoginLikeState(page);
+    if (state.isLoginUrl) {
+      throw new Error("Luego del login se cayó nuevamente a /login");
     }
 
-    const clickedBuscar = await findAndClickBuscar(page, log);
-    if (clickedBuscar) {
-      state.searchState = await analyzeSearchResultState(page, log);
-      if (state.searchState.tableVisible && !state.searchState.noResultsByText) {
-        state.table = await detectImportadorColumnAndPagination(page, log);
-      }
-      await returnToParametersIfPossible(page, log);
-    } else {
-      state.errors.push('No se pudo clickear botón "Buscar"');
-    }
+    const argentinaClick = await findAndOpenArgentinaMenu(page, log);
+    await waitArgentinaMenuOpened(page, log);
+    await page.screenshot({ path: STEP_MENU_OPEN, fullPage: true }).catch(() => {});
+
+    await clickImportacionesDetalladas(page, log);
+    await waitImportacionesDetalladasLoaded(page, log);
+    await page.screenshot({ path: STEP_IMPORT_OPEN, fullPage: true }).catch(() => {});
+
+    log("Navegación dashboard -> Argentina -> Importaciones Detalladas OK", "info", {
+      stepDashboard: STEP_DASHBOARD,
+      stepMenuOpen: STEP_MENU_OPEN,
+      stepImportOpen: STEP_IMPORT_OPEN,
+      argentinaFlagStrategy: argentinaClick.strategy,
+      argentinaFlagReason: argentinaClick.reason,
+      moduleClickStrategy: "texto exacto Importaciones Detalladas en menú abierto",
+      currentUrl: page.url(),
+    });
   } catch (error) {
-    state.errors.push(summarizeError(error));
-    log("Error durante la fase de análisis", "error", { error: summarizeError(error) });
+    log("Fallo en navegación", "error", { error: summarizeError(error), currentUrl: page.url() });
+    await page
+      .screenshot({ path: path.join(DATA_DIR, "navigation-failed.png"), fullPage: true })
+      .catch(() => {});
+    throw error;
   } finally {
-    state.summary = buildStrategySummary(state);
-    state.finishedAt = nowIso();
-    await saveJson(OUTPUTS.analysisJson, state);
-    log("Análisis UI guardado", "info", { file: OUTPUTS.analysisJson });
     await browser.close();
   }
 }
 
-runAnalysis().catch((error) => {
+runNavigationOnly().catch((error) => {
   console.error(`[fatal] ${summarizeError(error)}`);
   process.exit(1);
 });
+

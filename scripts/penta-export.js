@@ -32,6 +32,9 @@ const CONFIG = {
 const ROOT_DIR = path.resolve(__dirname, "..");
 const DATA_DIR = path.join(ROOT_DIR, "data");
 const NETWORK_DEBUG_PATH = path.join(DATA_DIR, "network-debug.json");
+const AUTH_STATE_PATH = path.join(DATA_DIR, "auth-state.json");
+const LOGIN_FAILED_SCREENSHOT = path.join(DATA_DIR, "login-failed.png");
+const LOGIN_FAILED_HTML = path.join(DATA_DIR, "login-failed.html");
 
 const MODULES = [
   {
@@ -51,6 +54,8 @@ const MODULES = [
 const SEARCH_TEXT_REGEX = /(buscar|consultar|aplicar|filtrar|ver resultados|search|submit)/i;
 const EMPTY_TEXT_REGEX = /(sin resultados|no records|no data|sin datos)/i;
 const KEYWORD_REGEX = /(import|export|detalle|data|formulario|search|grid)/i;
+const LOGIN_TEXT_REGEX =
+  /(user login|user password|forgot my password|enter|iniciar sesi[oó]n|ingresar|password)/i;
 
 function nowIso() {
   return new Date().toISOString();
@@ -101,6 +106,29 @@ async function ensureDirectories() {
   }
 }
 
+async function createContextWithAuthState(browser, log) {
+  const baseContextOptions = {
+    acceptDownloads: true,
+    viewport: { width: 1600, height: 1000 },
+  };
+
+  if (fssync.existsSync(AUTH_STATE_PATH)) {
+    try {
+      log("Intentando reutilizar auth-state", "info", { path: AUTH_STATE_PATH });
+      return await browser.newContext({
+        ...baseContextOptions,
+        storageState: AUTH_STATE_PATH,
+      });
+    } catch (error) {
+      log("No se pudo cargar auth-state, se inicia sesión limpia", "warn", {
+        error: summarizeError(error),
+      });
+    }
+  }
+
+  return browser.newContext(baseContextOptions);
+}
+
 async function waitForSettled(page) {
   await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
@@ -123,87 +151,186 @@ async function retry(action, options = {}) {
   throw new Error(`${actionName} failed: ${summarizeError(lastError)}`);
 }
 
-async function maybeLogin(page, log) {
-  const loginNeeded = await page
-    .evaluate(() => {
-      const url = window.location.href.toLowerCase();
-      const passInput = Boolean(document.querySelector('input[type="password"]'));
-      return passInput || /login|signin|ingresar|sesion|session/.test(url);
-    })
-    .catch(() => false);
+async function isLoginLikeState(page) {
+  return page
+    .evaluate((loginRegexSource) => {
+      const loginRegex = new RegExp(loginRegexSource, "i");
+      const url = window.location.href;
+      const urlLower = url.toLowerCase();
+      const visibleText = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000);
+      const hasPasswordInput = document.querySelectorAll('input[type="password"]').length > 0;
+      const hasLoginText = loginRegex.test(visibleText);
+      const isLoginUrl = /\/login(?:\/|$|\?)/i.test(urlLower) || /signin|session|sesion|ingresar/.test(urlLower);
+      return {
+        url,
+        isLoginUrl,
+        hasPasswordInput,
+        hasLoginText,
+        isLoginLike: isLoginUrl || hasPasswordInput || hasLoginText,
+        visibleTextPreview: visibleText.slice(0, 600),
+      };
+    }, LOGIN_TEXT_REGEX.source)
+    .catch(() => ({
+      url: page.url(),
+      isLoginUrl: /\/login(?:\/|$|\?)/i.test(page.url().toLowerCase()),
+      hasPasswordInput: false,
+      hasLoginText: false,
+      isLoginLike: /\/login(?:\/|$|\?)/i.test(page.url().toLowerCase()),
+      visibleTextPreview: "",
+    }));
+}
 
-  if (!loginNeeded) {
-    log("Sesión reutilizada / login no requerido");
+async function saveLoginFailureArtifacts(page, log) {
+  await page
+    .screenshot({ path: LOGIN_FAILED_SCREENSHOT, fullPage: true })
+    .then(() => log("Screenshot de login fallido guardado", "warn", { path: LOGIN_FAILED_SCREENSHOT }))
+    .catch((error) => log("No se pudo guardar screenshot de login fallido", "warn", { error: summarizeError(error) }));
+  const html = await page.content().catch(() => "");
+  if (html) {
+    await fs.writeFile(LOGIN_FAILED_HTML, html, "utf8");
+    log("HTML de login fallido guardado", "warn", { path: LOGIN_FAILED_HTML });
+  }
+}
+
+async function getFirstVisibleLocator(page, selectors) {
+  for (const selector of selectors) {
+    const loc = page.locator(selector).first();
+    if (await loc.isVisible().catch(() => false)) {
+      return { locator: loc, selector };
+    }
+  }
+  return null;
+}
+
+async function ensureLoggedIn(page, context, log) {
+  log("login iniciado");
+  const loginUrl = `${CONFIG.baseUrl}/login`;
+
+  await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
+  await waitForSettled(page);
+
+  const preState = await isLoginLikeState(page);
+  if (!preState.isLoginLike && !preState.isLoginUrl) {
+    log("Sesión ya activa al abrir /login", "info", { url: preState.url });
+    await context.storageState({ path: AUTH_STATE_PATH });
+    log("Estado autenticado guardado", "info", { path: AUTH_STATE_PATH });
     return;
   }
 
-  log("Login detectado, completando credenciales");
-  const userLocator = page.locator(
-    [
-      'input[name*="user" i]',
-      'input[id*="user" i]',
-      'input[name*="mail" i]',
-      'input[type="email"]',
-      'input[placeholder*="usuario" i]',
-      "input[type='text']",
-    ].join(",")
-  );
-  const passLocator = page.locator(
-    [
-      'input[name*="pass" i]',
-      'input[id*="pass" i]',
-      'input[placeholder*="clave" i]',
-      'input[placeholder*="contras" i]',
-      'input[type="password"]',
-    ].join(",")
-  );
+  const userCandidate = await getFirstVisibleLocator(page, [
+    'input[name*="user" i]',
+    'input[id*="user" i]',
+    'input[name*="mail" i]',
+    'input[type="email"]',
+    'input[placeholder*="usuario" i]',
+    'input[placeholder*="user" i]',
+    'input[autocomplete="username"]',
+    'input[type="text"]',
+  ]);
+  const passCandidate = await getFirstVisibleLocator(page, [
+    'input[name*="pass" i]',
+    'input[id*="pass" i]',
+    'input[placeholder*="clave" i]',
+    'input[placeholder*="password" i]',
+    'input[autocomplete="current-password"]',
+    'input[type="password"]',
+  ]);
 
-  if (!(await userLocator.first().isVisible().catch(() => false))) {
-    throw new Error("Input de usuario no encontrado");
+  if (!userCandidate || !passCandidate) {
+    log("No se detectaron campos de login", "error", {
+      userFound: Boolean(userCandidate),
+      passFound: Boolean(passCandidate),
+      url: page.url(),
+    });
+    await saveLoginFailureArtifacts(page, log);
+    throw new Error("No se detectaron campos de usuario/password en /login");
   }
-  if (!(await passLocator.first().isVisible().catch(() => false))) {
-    throw new Error("Input de contraseña no encontrado");
-  }
 
-  await userLocator.first().fill(CONFIG.user, { timeout: 15000 });
-  await passLocator.first().fill(CONFIG.pass, { timeout: 15000 });
+  log("campos detectados", "info", {
+    userSelector: userCandidate.selector,
+    passSelector: passCandidate.selector,
+  });
 
-  const submitLoc = page.locator(
-    'button, [role="button"], a, input[type="button"], input[type="submit"], .btn'
-  );
-  const count = await submitLoc.count().catch(() => 0);
-  let clicked = false;
-  for (let i = 0; i < count; i += 1) {
-    const item = submitLoc.nth(i);
-    if (!(await item.isVisible().catch(() => false))) continue;
-    const text = await item
-      .evaluate((el) =>
-        `${el.innerText || ""} ${el.textContent || ""} ${el.value || ""}`.replace(/\s+/g, " ").trim()
-      )
+  await userCandidate.locator.fill(CONFIG.user, { timeout: 15000 });
+  await passCandidate.locator.fill(CONFIG.pass, { timeout: 15000 });
+
+  const submit = await getFirstVisibleLocator(page, [
+    'button[type="submit"]',
+    'input[type="submit"]',
+    'button:has-text("Enter")',
+    'button:has-text("Ingresar")',
+    'button:has-text("Login")',
+    '[role="button"]:has-text("Enter")',
+    '[role="button"]:has-text("Ingresar")',
+    "button",
+    '[role="button"]',
+    "a",
+    ".btn",
+  ]);
+
+  const previousUrl = page.url();
+  if (submit) {
+    const submitText = await submit.locator
+      .evaluate((el) => (el.innerText || el.textContent || el.value || "").replace(/\s+/g, " ").trim())
       .catch(() => "");
-    if (/(ingresar|iniciar|acceder|login|entrar|submit)/i.test(text)) {
-      await Promise.all([
-        page.waitForLoadState("networkidle", { timeout: 35000 }).catch(() => {}),
-        item.click({ timeout: 12000 }),
-      ]);
-      clicked = true;
-      break;
-    }
-  }
-  if (!clicked) {
-    await passLocator.first().press("Enter");
-    await page.waitForLoadState("networkidle", { timeout: 35000 }).catch(() => {});
+    log("submit ejecutado", "info", { element: submit.selector, text: submitText });
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => null),
+      submit.locator.click({ timeout: 12000 }),
+    ]).catch(() => {});
+  } else {
+    log("No se encontró botón submit explícito, usando Enter en password", "warn");
+    await passCandidate.locator.press("Enter");
   }
 
-  const stillLogin = await page
-    .evaluate(() => {
-      const passInput = Boolean(document.querySelector('input[type="password"]'));
-      const url = window.location.href.toLowerCase();
-      return passInput && /login|signin|ingresar|sesion|session/.test(url);
-    })
-    .catch(() => true);
-  if (stillLogin) throw new Error("Login no completado: pantalla de autenticación visible");
-  log("login ok");
+  await Promise.race([
+    page.waitForURL((url) => !url.toString().toLowerCase().includes("/login"), { timeout: 20000 }).catch(() => null),
+    page.locator('input[type="password"]').first().waitFor({ state: "hidden", timeout: 20000 }).catch(() => null),
+    sleep(4500),
+  ]);
+  await waitForSettled(page);
+
+  const postState = await isLoginLikeState(page);
+  log("url post-login", "info", {
+    previousUrl,
+    currentUrl: postState.url,
+    isLoginUrl: postState.isLoginUrl,
+    hasLoginText: postState.hasLoginText,
+    hasPasswordInput: postState.hasPasswordInput,
+  });
+
+  const loginFailed = postState.isLoginUrl || postState.hasLoginText || postState.hasPasswordInput;
+  if (loginFailed) {
+    log("login fallido", "error", {
+      url: postState.url,
+      visibleTextPreview: postState.visibleTextPreview,
+    });
+    await saveLoginFailureArtifacts(page, log);
+    throw new Error("Login fallido: sigue en /login o la UI mantiene señales de formulario de login");
+  }
+
+  await context.storageState({ path: AUTH_STATE_PATH });
+  log("login exitoso", "info", { url: postState.url });
+  log("Estado autenticado guardado", "info", { path: AUTH_STATE_PATH });
+}
+
+function frameScore(frameInfo) {
+  return (
+    Number(frameInfo?.tr || 0) +
+    Number(frameInfo?.roleRow || 0) * 2 +
+    Number(frameInfo?.agRow || 0) * 2 +
+    Number(frameInfo?.pDatatableRows || 0) * 2 +
+    Number(frameInfo?.table || 0)
+  );
+}
+
+function isLoginLikeFrameInfo(frameInfo) {
+  if (!frameInfo) return false;
+  const frameUrl = String(frameInfo.url || "").toLowerCase();
+  const visibleText = String(frameInfo.visibleText || "");
+  const isLoginUrl = /\/login(?:\/|$|\?)/i.test(frameUrl) || /signin|session|sesion|ingresar/.test(frameUrl);
+  const hasLoginText = LOGIN_TEXT_REGEX.test(visibleText);
+  return isLoginUrl || hasLoginText;
 }
 
 function createNetworkCollector(page, log, bucket) {
@@ -404,6 +531,16 @@ async function getFrameDiagnostics(frame) {
     }));
 }
 
+function isFrameInfoLoginLike(frameInfo) {
+  if (!frameInfo) return false;
+  const url = String(frameInfo.url || "").toLowerCase();
+  const visibleText = String(frameInfo.visibleText || "");
+  const hasPasswordSignals = Number(frameInfo.input || 0) > 0 && /password|clave/i.test(visibleText);
+  const isLoginUrl = /\/login(?:\/|$|\?)/i.test(url) || /signin|session|sesion|ingresar/.test(url);
+  const hasLoginText = LOGIN_TEXT_REGEX.test(visibleText);
+  return isLoginUrl || hasLoginText || hasPasswordSignals;
+}
+
 async function captureDeepDiagnostics(page, moduleDef, log) {
   const screenshotPath = path.join(DATA_DIR, `${moduleDef.debugBaseName}.png`);
   const htmlPath = path.join(DATA_DIR, `${moduleDef.debugBaseName}.html`);
@@ -441,26 +578,27 @@ async function captureDeepDiagnostics(page, moduleDef, log) {
     });
   }
 
-  const candidate = frameInfos
-    .slice()
-    .sort((a, b) => {
-      const scoreA = a.tr + a.roleRow + a.agRow + a.pDatatableRows;
-      const scoreB = b.tr + b.roleRow + b.agRow + b.pDatatableRows;
-      return scoreB - scoreA;
-    })[0];
-  const selectedFrame = candidate
-    ? frames[candidate.frameIndex]
-    : page.mainFrame();
+  const scoredCandidates = frameInfos
+    .map((frameInfo) => ({
+      ...frameInfo,
+      score:
+        Number(frameInfo.tr || 0) +
+        Number(frameInfo.roleRow || 0) +
+        Number(frameInfo.agRow || 0) +
+        Number(frameInfo.pDatatableRows || 0),
+      isLoginLike: isFrameInfoLoginLike(frameInfo),
+    }))
+    .filter((frameInfo) => !frameInfo.isLoginLike)
+    .sort((a, b) => b.score - a.score);
+
+  const candidate = scoredCandidates[0] || frameInfos.find((f) => f.frameType === "main_page") || frameInfos[0];
 
   log("Frame seleccionado para extracción", "info", {
     frameIndex: candidate?.frameIndex ?? 0,
     frameType: candidate?.frameType ?? "main_page",
     frameUrl: candidate?.url || page.url(),
-    score:
-      (candidate?.tr || 0) +
-      (candidate?.roleRow || 0) +
-      (candidate?.agRow || 0) +
-      (candidate?.pDatatableRows || 0),
+    score: candidate?.score ?? 0,
+    isLoginLike: Boolean(candidate && isFrameInfoLoginLike(candidate)),
   });
 
   return {
@@ -468,6 +606,7 @@ async function captureDeepDiagnostics(page, moduleDef, log) {
     htmlPath,
     frameInfos,
     selectedFrameIndex: candidate?.frameIndex ?? 0,
+    selectedFrameInfo: candidate || null,
   };
 }
 
@@ -1057,13 +1196,68 @@ async function processModule(page, context, moduleDef, allLogs, networkBucket) {
 
   log("Navegando módulo", "info", { moduleUrl });
   await page.goto(moduleUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
-  await maybeLogin(page, log);
   await waitForSettled(page);
+
+  let moduleState = await isLoginLikeState(page);
+  if (moduleState.isLoginUrl || moduleState.isLoginLike) {
+    log("Redirección a login detectada al entrar al módulo", "warn", {
+      currentUrl: moduleState.url,
+      visibleTextPreview: moduleState.visibleTextPreview,
+    });
+    await ensureLoggedIn(page, context, log);
+    await page.goto(moduleUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
+    await waitForSettled(page);
+    moduleState = await isLoginLikeState(page);
+    if (moduleState.isLoginUrl || moduleState.isLoginLike) {
+      const msg = "No se pudo abrir módulo autenticado: sigue en login tras reintento";
+      errors.push(msg);
+      log(msg, "error", {
+        currentUrl: moduleState.url,
+        visibleTextPreview: moduleState.visibleTextPreview,
+      });
+      return {
+        module: moduleDef.key,
+        moduleUrl,
+        rawRows,
+        normalizedRows,
+        diagnostics: null,
+        usedMechanisms: [...usedMechanisms],
+        errors,
+      };
+    }
+  }
 
   const networkCollector = createNetworkCollector(page, log, networkBucket);
   await sleep(800);
 
-  const diagnostics = await captureDeepDiagnostics(page, moduleDef, log);
+  let diagnostics = await captureDeepDiagnostics(page, moduleDef, log);
+  if (diagnostics.selectedFrameInfo && isFrameInfoLoginLike(diagnostics.selectedFrameInfo)) {
+    log("Contexto seleccionado parece login, forzando reautenticación", "warn", {
+      frameUrl: diagnostics.selectedFrameInfo.url,
+      visibleTextPreview: (diagnostics.selectedFrameInfo.visibleText || "").slice(0, 400),
+    });
+    await ensureLoggedIn(page, context, log);
+    await page.goto(moduleUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
+    await waitForSettled(page);
+    diagnostics = await captureDeepDiagnostics(page, moduleDef, log);
+    if (diagnostics.selectedFrameInfo && isFrameInfoLoginLike(diagnostics.selectedFrameInfo)) {
+      const msg = "El contexto de extracción sigue siendo login luego de reautenticación";
+      errors.push(msg);
+      log(msg, "error", {
+        frameUrl: diagnostics.selectedFrameInfo.url,
+        visibleTextPreview: (diagnostics.selectedFrameInfo.visibleText || "").slice(0, 400),
+      });
+      return {
+        module: moduleDef.key,
+        moduleUrl,
+        rawRows,
+        normalizedRows,
+        diagnostics,
+        usedMechanisms: [...usedMechanisms],
+        errors,
+      };
+    }
+  }
   const frames = page.frames();
   const selectedFrame = frames[diagnostics.selectedFrameIndex] || page.mainFrame();
   const selectedScope =
@@ -1219,10 +1413,7 @@ async function main() {
   const log = makeLogger("main", allLogs);
 
   const browser = await chromium.launch({ headless: CONFIG.headless });
-  const context = await browser.newContext({
-    acceptDownloads: true,
-    viewport: { width: 1600, height: 1000 },
-  });
+  const context = await createContextWithAuthState(browser, log);
   const page = await context.newPage();
   page.setDefaultTimeout(CONFIG.timeoutMs);
 
@@ -1231,7 +1422,8 @@ async function main() {
     const initialUrl = `${CONFIG.baseUrl}${MODULES[0].urlPath}`;
     log("Inicio de ejecución", "info", { baseUrl: CONFIG.baseUrl, initialUrl });
     await page.goto(initialUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.timeoutMs });
-    await maybeLogin(page, makeLogger("auth", allLogs));
+    const authLog = makeLogger("auth", allLogs);
+    await ensureLoggedIn(page, context, authLog);
     await waitForSettled(page);
 
     for (const moduleDef of MODULES) {

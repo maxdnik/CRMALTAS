@@ -423,9 +423,16 @@ async function ensureLoggedIn(page, context, log) {
       .catch(() => {});
   }
 
+  // Validación principal por navegación: dar hasta 10s para llegar a /home.
   await Promise.race([
-    page.waitForURL((url) => !url.toString().toLowerCase().includes("/login"), { timeout: 20000 }).catch(() => null),
-    page.locator('input[type="password"]').first().waitFor({ state: "hidden", timeout: 20000 }).catch(() => null),
+    page
+      .waitForURL((url) => url.toString().toLowerCase().includes("/home/"), { timeout: 10000 })
+      .catch(() => null),
+    page
+      .waitForURL((url) => !url.toString().toLowerCase().includes("/login"), { timeout: 10000 })
+      .catch(() => null),
+    // Soporte SPA: el formulario puede mantenerse montado transitoriamente.
+    page.locator('input[type="password"]').first().waitFor({ state: "hidden", timeout: 10000 }).catch(() => null),
     sleep(4500),
   ]);
   await waitForSettled(page);
@@ -446,20 +453,31 @@ async function ensureLoggedIn(page, context, log) {
     throw new Error("Login fallido: se navegó a recuperación de contraseña");
   }
 
-  const loginFailed = postState.isLoginUrl || postState.hasLoginText || postState.hasPasswordInput;
-  if (loginFailed) {
+  const loginSuccess = !postUrlLower.includes("/login") && postUrlLower.includes("/home");
+  if (loginSuccess) {
+    log("login exitoso por navegación a /home/dashboard", "info", { url: postState.url });
+    await context.storageState({ path: AUTH_STATE_PATH });
+    await saveLoginSuccessScreenshot(page, log);
+    log("Estado autenticado guardado", "info", { path: AUTH_STATE_PATH });
+    return;
+  }
+
+  // Falla únicamente si sigue en /login tras timeout o navega fuera de home.
+  if (postUrlLower.includes("/login")) {
     log("login fallido", "error", {
       url: postState.url,
       visibleTextPreview: postState.visibleTextPreview,
     });
     await saveLoginFailureArtifacts(page, log);
-    throw new Error("Login fallido: sigue en /login o la UI mantiene señales de formulario de login");
+    throw new Error("Login fallido: sigue en /login luego del timeout");
   }
 
-  await context.storageState({ path: AUTH_STATE_PATH });
-  log("login exitoso", "info", { url: postState.url });
-  await saveLoginSuccessScreenshot(page, log);
-  log("Estado autenticado guardado", "info", { path: AUTH_STATE_PATH });
+  log("login fallido", "error", {
+    url: postState.url,
+    reason: "No navegó a /home",
+  });
+  await saveLoginFailureArtifacts(page, log);
+  throw new Error("Login fallido: no navegó a /home");
 }
 
 function frameScore(frameInfo) {

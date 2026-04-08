@@ -35,6 +35,12 @@ const LOGIN_SUCCESS_SCREENSHOT = path.join(DATA_DIR, "login-success.png");
 const STEP_DASHBOARD = path.join(DATA_DIR, "step-dashboard.png");
 const STEP_MENU_OPEN = path.join(DATA_DIR, "step-argentina-menu-open.png");
 const STEP_IMPORT_OPEN = path.join(DATA_DIR, "step-importaciones-detalladas-open.png");
+const STEP_MENU_BEFORE_IMPORT_CLICK = path.join(
+  DATA_DIR,
+  "step-menu-before-click-importaciones-detalladas.png"
+);
+const IMPORT_CLICK_FAILED_HTML = path.join(DATA_DIR, "importaciones-detalladas-click-failed.html");
+const IMPORT_CLICK_FAILED_PNG = path.join(DATA_DIR, "importaciones-detalladas-click-failed.png");
 
 const LOGIN_TEXT_REGEX =
   /(user login|user password|forgot my password|enter|iniciar sesi[oó]n|ingresar|password)/i;

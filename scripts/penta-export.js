@@ -409,33 +409,244 @@ async function waitArgentinaMenuOpened(page, log) {
 }
 
 async function clickImportacionesDetalladas(page, log) {
-  const clicked = await page.evaluate(() => {
-    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim().toLowerCase();
+  await page.screenshot({ path: STEP_MENU_BEFORE_IMPORT_CLICK, fullPage: true }).catch(() => {});
+
+  const menuAnalysis = await page.evaluate(() => {
+    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
     const visible = (el) => {
       const st = window.getComputedStyle(el);
       const r = el.getBoundingClientRect();
       return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
     };
-    const nodes = Array.from(
-      document.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, span, div, ion-item, ion-button")
+    const bbox = (el) => {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top, width: r.width, height: r.height, right: r.right, bottom: r.bottom };
+    };
+
+    const allMenuNodes = Array.from(
+      document.querySelectorAll("[role='menu'], .menu, .dropdown-menu, .popover, ion-popover, ion-list, ul, .mat-mdc-menu-panel")
     ).filter(visible);
-    const target = nodes.find((el) => normalize(el.innerText || el.textContent || "") === "importaciones detalladas");
-    if (!target) return false;
-    target.click();
-    return true;
+
+    // Heurística: contenedor que más se parece a menú Argentina (con varias filas visibles y texto import/export)
+    let bestMenu = null;
+    let bestScore = -1;
+    for (const menu of allMenuNodes) {
+      const txt = normalize(menu.innerText || menu.textContent || "").toLowerCase();
+      const rows = Array.from(menu.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, div, ion-item, mat-list-item"))
+        .filter(visible)
+        .filter((el) => normalize(el.innerText || el.textContent || "").length > 0);
+      let score = rows.length;
+      if (txt.includes("importaciones detalladas")) score += 20;
+      if (txt.includes("importaciones")) score += 10;
+      if (txt.includes("exportaciones")) score += 10;
+      if (score > bestScore) {
+        bestScore = score;
+        bestMenu = menu;
+      }
+    }
+
+    // fallback si no encontró menú claro
+    if (!bestMenu) {
+      const fallbackRows = Array.from(
+        document.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, div, ion-item, mat-list-item")
+      )
+        .filter(visible)
+        .filter((el) => normalize(el.innerText || el.textContent || "").length > 0)
+        .filter((el) => bbox(el).top < window.innerHeight * 0.65)
+        .slice(0, 30);
+
+      const rowsData = fallbackRows.map((row, idx) => ({
+        index: idx + 1,
+        text: normalize(row.innerText || row.textContent || "").slice(0, 200),
+        tagName: (row.tagName || "").toLowerCase(),
+        className: String(row.className || "").slice(0, 180),
+        role: row.getAttribute("role") || "",
+        boundingBox: bbox(row),
+        outerHTML: (row.outerHTML || "").replace(/\s+/g, " ").trim().slice(0, 260),
+      }));
+      return {
+        menuFound: false,
+        menuBox: null,
+        rows: rowsData,
+        targetRow: rowsData[1] || null,
+      };
+    }
+
+    const rowCandidates = Array.from(
+      bestMenu.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, div, ion-item, mat-list-item")
+    )
+      .filter(visible)
+      .filter((el) => {
+        const t = normalize(el.innerText || el.textContent || "");
+        const r = bbox(el);
+        return t.length > 0 && r.height >= 18;
+      });
+
+    // Deduplicar visualmente por bbox similar (padres/hijos repetidos)
+    const dedupRows = [];
+    for (const row of rowCandidates) {
+      const r = bbox(row);
+      const exists = dedupRows.some((existing) => {
+        const e = bbox(existing);
+        return Math.abs(e.top - r.top) < 4 && Math.abs(e.left - r.left) < 8 && Math.abs(e.height - r.height) < 6;
+      });
+      if (!exists) dedupRows.push(row);
+    }
+
+    dedupRows.sort((a, b) => bbox(a).top - bbox(b).top);
+
+    const rowsData = dedupRows.map((row, idx) => ({
+      index: idx + 1,
+      text: normalize(row.innerText || row.textContent || "").slice(0, 200),
+      tagName: (row.tagName || "").toLowerCase(),
+      className: String(row.className || "").slice(0, 180),
+      id: row.id || "",
+      role: row.getAttribute("role") || "",
+      boundingBox: bbox(row),
+      outerHTML: (row.outerHTML || "").replace(/\s+/g, " ").trim().slice(0, 260),
+    }));
+
+    // objetivo principal: segunda fila visible
+    const targetRowEl = dedupRows[1] || null;
+    const targetRow = rowsData[1] || null;
+
+    // ícono de segunda fila (fallback obligatorio)
+    let targetIcon = null;
+    if (targetRowEl) {
+      const icon = targetRowEl.querySelector("ion-icon, i, svg, .icon, [class*='icon'], [class*='chevron'], [class*='arrow']");
+      if (icon && visible(icon)) {
+        targetIcon = {
+          tagName: (icon.tagName || "").toLowerCase(),
+          className: String(icon.className || "").slice(0, 180),
+          boundingBox: bbox(icon),
+        };
+      }
+    }
+
+    const menuBox = bbox(bestMenu);
+
+    return {
+      menuFound: true,
+      menuBox,
+      rows: rowsData.slice(0, 20),
+      targetRow,
+      targetIcon,
+    };
   });
 
-  if (!clicked) {
-    const fallback = page.getByText("Importaciones Detalladas", { exact: true }).first();
-    if (await fallback.isVisible().catch(() => false)) {
-      await fallback.click({ timeout: 7000 }).catch(() => {});
-    } else {
-      throw new Error('No se pudo clickear "Importaciones Detalladas" en el menú de Argentina');
-    }
+  log("ítems de menú detectados", "info", {
+    count: menuAnalysis.rows.length,
+    rows: menuAnalysis.rows,
+  });
+
+  if (!menuAnalysis.targetRow) {
+    throw new Error("No se pudo identificar la segunda fila visible del menú de Argentina");
   }
 
-  log("click en Importaciones Detalladas ejecutado");
+  log("segunda fila seleccionada como target", "info", {
+    targetRow: menuAnalysis.targetRow,
+  });
+
+  let clickStrategyUsed = "";
+  const clickResult = await page.evaluate((targetInfo, menuInfo) => {
+    const normalize = (txt) => (txt || "").replace(/\s+/g, " ").trim();
+    const visible = (el) => {
+      const st = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+    };
+    const bbox = (el) => {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top, width: r.width, height: r.height };
+    };
+
+    const clickAt = (x, y) => {
+      const target = document.elementFromPoint(x, y);
+      if (!target) return false;
+      target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y }));
+      target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y }));
+      target.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y }));
+      return true;
+    };
+
+    // localizar fila objetivo por bbox+texto
+    const allRows = Array.from(
+      document.querySelectorAll("button, a, [role='menuitem'], [role='button'], li, div, ion-item, mat-list-item")
+    ).filter(visible);
+    const target = allRows.find((el) => {
+      const t = normalize(el.innerText || el.textContent || "").slice(0, 200);
+      const r = bbox(el);
+      return (
+        t === targetInfo.text &&
+        Math.abs(r.top - targetInfo.boundingBox.top) < 8 &&
+        Math.abs(r.left - targetInfo.boundingBox.left) < 12 &&
+        Math.abs(r.height - targetInfo.boundingBox.height) < 10
+      );
+    });
+
+    if (target) {
+      target.scrollIntoView({ block: "center", inline: "nearest" });
+      try {
+        target.click();
+        return { ok: true, strategy: "locator/dom-row-click" };
+      } catch {
+        const r = target.getBoundingClientRect();
+        const centerOk = clickAt(r.left + r.width / 2, r.top + r.height / 2);
+        if (centerOk) return { ok: true, strategy: "bbox-row-center-click" };
+        const leftShiftOk = clickAt(r.left + Math.max(24, Math.min(44, r.width * 0.2)), r.top + r.height / 2);
+        if (leftShiftOk) return { ok: true, strategy: "bbox-row-left-shift-click" };
+      }
+    }
+
+    // fallback 1: click icono segunda fila
+    if (targetInfo.targetIcon && targetInfo.targetIcon.boundingBox) {
+      const ib = targetInfo.targetIcon.boundingBox;
+      const iconCenterOk = clickAt(ib.left + ib.width / 2, ib.top + ib.height / 2);
+      if (iconCenterOk) return { ok: true, strategy: "second-row-icon-bbox-click" };
+    }
+
+    // fallback 2: coordenada absoluta basada en menú
+    if (menuInfo && menuInfo.menuBox) {
+      const m = menuInfo.menuBox;
+      const targetX = m.left + 40;
+      const targetY = m.top + (m.height * 2.5) / 5;
+      const absOk = clickAt(targetX, targetY);
+      if (absOk) return { ok: true, strategy: "absolute-menu-coordinate-click", targetX, targetY };
+    }
+
+    return { ok: false, strategy: "none" };
+  }, menuAnalysis.targetRow, menuAnalysis);
+
+  clickStrategyUsed = clickResult.strategy || "none";
+  log("click sobre segunda fila ejecutado", clickResult.ok ? "info" : "warn", {
+    clickStrategy: clickStrategyUsed,
+  });
+
+  const loaded = await page
+    .waitForFunction(() => {
+      const txt = (document.body?.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+      return (
+        txt.includes("argentina - importaciones detalladas") &&
+        (txt.includes("consulta por parámetros") || txt.includes("consulta por parametros"))
+      );
+    }, { timeout: 10000 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (!loaded) {
+    await page.screenshot({ path: IMPORT_CLICK_FAILED_PNG, fullPage: true }).catch(() => {});
+    const html = await page.content().catch(() => "");
+    if (html) await fs.writeFile(IMPORT_CLICK_FAILED_HTML, html, "utf8");
+    throw new Error(
+      `No cargó Importaciones Detalladas luego del click en segunda fila. Estrategia usada: ${clickStrategyUsed}`
+    );
+  }
+
+  log("click en Importaciones Detalladas ejecutado", "info", {
+    clickStrategy: clickStrategyUsed,
+  });
   await waitForSettled(page);
+  return { clickStrategy: clickStrategyUsed, rowCount: menuAnalysis.rows.length };
 }
 
 async function waitImportacionesDetalladasLoaded(page, log) {
@@ -486,7 +697,7 @@ async function runNavigationOnly() {
     await waitArgentinaMenuOpened(page, log);
     await page.screenshot({ path: STEP_MENU_OPEN, fullPage: true }).catch(() => {});
 
-    await clickImportacionesDetalladas(page, log);
+    const importClick = await clickImportacionesDetalladas(page, log);
     await waitImportacionesDetalladasLoaded(page, log);
     await page.screenshot({ path: STEP_IMPORT_OPEN, fullPage: true }).catch(() => {});
 
@@ -496,7 +707,8 @@ async function runNavigationOnly() {
       stepImportOpen: STEP_IMPORT_OPEN,
       argentinaFlagStrategy: argentinaClick.strategy,
       argentinaFlagReason: argentinaClick.reason,
-      moduleClickStrategy: "texto exacto Importaciones Detalladas en menú abierto",
+      menuRowsDetected: importClick.rowCount,
+      moduleClickStrategy: importClick.clickStrategy,
       currentUrl: page.url(),
     });
   } catch (error) {

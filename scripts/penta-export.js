@@ -511,10 +511,10 @@ async function waitArgentinaMenuOpened(page, log) {
 async function clickImportacionesDetalladas(page, log, scopedMenu) {
   await page.screenshot({ path: STEP_MENU_BEFORE_IMPORT_CLICK, fullPage: true }).catch(() => {});
 
-  const scoped = scopedMenu || (await detectArgentinaMenuScoped(page));
-  if (!scoped?.menuFound) {
-    throw new Error("No se encontró menú scopiado de Argentina para clickear opción");
+  if (!scopedMenu?.menuFound || !scopedMenu.menuBox) {
+    throw new Error("Se requiere menú scopiado previamente detectado (sin redetección)");
   }
+  const scoped = scopedMenu;
 
   log("opciones detectadas dentro del menú scopiado", "info", {
     optionTexts: scoped.rows.map((r) => r.text),
@@ -558,6 +558,7 @@ async function clickImportacionesDetalladas(page, log, scopedMenu) {
         "[role='menu'], .dropdown-menu, .menu, .mat-mdc-menu-panel, .cdk-overlay-pane, ion-popover, ion-list, .popover, .p-menu, .p-tieredmenu"
       )
     ).filter(visible);
+    // IMPORTANTE: usar el menú previamente detectado por su caja.
     const menu = menuCandidates.find((m) => {
       const b = bbox(m);
       return (
@@ -566,7 +567,7 @@ async function clickImportacionesDetalladas(page, log, scopedMenu) {
         close(b.width, scopedArg.menuBox.width, 40) &&
         close(b.height, scopedArg.menuBox.height, 60)
       );
-    }) || menuCandidates[0];
+    });
 
     if (!menu) return { ok: false, strategy: "no-menu" };
 
@@ -694,10 +695,10 @@ async function runNavigationOnly() {
     }
 
     const argentinaClick = await findAndOpenArgentinaMenu(page, log);
-    await waitArgentinaMenuOpened(page, log);
+    const scopedMenu = await waitArgentinaMenuOpened(page, log);
     await page.screenshot({ path: STEP_MENU_OPEN, fullPage: true }).catch(() => {});
 
-    const importClick = await clickImportacionesDetalladas(page, log);
+    const importClick = await clickImportacionesDetalladas(page, log, scopedMenu);
     await waitImportacionesDetalladasLoaded(page, log);
     await page.screenshot({ path: STEP_IMPORT_OPEN, fullPage: true }).catch(() => {});
 
